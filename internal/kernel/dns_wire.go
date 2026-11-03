@@ -19,6 +19,7 @@ type dnsAnswer struct {
 	ips       []netip.Addr
 	ttl       time.Duration
 	truncated bool
+	nxdomain  bool
 }
 
 func dnsQuestion(name string, typ dnsmessage.Type) ([]byte, dnsmessage.Question, error) {
@@ -42,7 +43,7 @@ func parseDNSAnswer(w []byte, id uint16, q dnsmessage.Question) (dnsAnswer, erro
 	}
 	var parser dnsmessage.Parser
 	h, e := parser.Start(w)
-	if e != nil || !h.Response || h.ID != id || h.OpCode != 0 || h.RCode != dnsmessage.RCodeSuccess {
+	if e != nil || !h.Response || h.ID != id || h.OpCode != 0 || h.RCode != dnsmessage.RCodeSuccess && h.RCode != dnsmessage.RCodeNameError {
 		return out, errDNS
 	}
 	qs, e := parser.AllQuestions()
@@ -61,6 +62,7 @@ func parseDNSAnswer(w []byte, id uint16, q dnsmessage.Question) (dnsAnswer, erro
 	if m.Unpack(w) != nil {
 		return out, errDNS
 	}
+	out.nxdomain = h.RCode == dnsmessage.RCodeNameError
 	name := strings.ToLower(q.Name.String())
 	ttl := uint32(300)
 	minTTL := func(v uint32) {
@@ -109,7 +111,7 @@ func parseDNSAnswer(w []byte, id uint16, q dnsmessage.Question) (dnsAnswer, erro
 			}
 		}
 		if found {
-			if cname != "" {
+			if cname != "" || out.nxdomain {
 				return out, errDNS
 			}
 			out.ttl = time.Duration(ttl) * time.Second

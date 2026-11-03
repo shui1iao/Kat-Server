@@ -22,7 +22,8 @@ func isClash(b []byte) bool {
 
 func parseClash(b []byte) (Result, error) {
 	var doc struct {
-		Proxies []any `yaml:"proxies"`
+		Proxies []any            `yaml:"proxies"`
+		Groups  []map[string]any `yaml:"proxy-groups"`
 	}
 	if e := yaml.Unmarshal(b, &doc); e != nil {
 		return Result{}, fmt.Errorf("%w: invalid YAML", ErrFormat)
@@ -37,7 +38,15 @@ func parseClash(b []byte) (Result, error) {
 			r.skip("", "", "entry is not a mapping")
 			continue
 		}
+		if v, ok := m["dialer-proxy"]; ok {
+			if dp, ok := v.(string); !ok || dp == "" {
+				return Result{}, ErrDependency
+			}
+		}
 		clashNode(&r, m)
+	}
+	if e := clashDependencies(&r, doc.Proxies, doc.Groups); e != nil {
+		return Result{}, e
 	}
 	return r, nil
 }
@@ -129,15 +138,12 @@ var clashIgnored = []string{"tfo", "mptcp", "ip-version", "interface-name", "rou
 func clashNode(r *Result, m map[string]any) {
 	name := str(m, "name")
 	typ := strings.ToLower(str(m, "type"))
-	if dp := str(m, "dialer-proxy"); dp != "" {
-		r.skip(name, typ, "dialer-proxy chaining is not supported in providers")
-		return
-	}
+
 	if s := sub(m, "smux"); s != nil && flag(s, "enabled") {
 		r.skip(name, typ, "smux multiplexing is not supported")
 		return
 	}
-	o := outbound.Options{Name: name, Server: host(str(m, "server")), Port: port(str(m, "port")), UDP: boolPtr(flag(m, "udp"))}
+	o := outbound.Options{Via: str(m, "dialer-proxy"), Name: name, Server: host(str(m, "server")), Port: port(str(m, "port")), UDP: boolPtr(flag(m, "udp"))}
 	n := Node{}
 	switch typ {
 	case "ss":

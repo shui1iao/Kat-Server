@@ -63,6 +63,8 @@ func startTest(t *testing.T, in Inbound, modify func(*Config)) *Server {
 		in.Listen = "127.0.0.1:0"
 	}
 	c := Config{UDPBindIPv4: "127.0.0.1", UDPBindIPv6: "::1", Inbounds: []Inbound{in}, Limits: Limits{Connections: 32, Handshakes: 16, Dials: 8, UDPAssociations: 8, UDPQueue: 4, UDPTargets: 4, PoolBuffers: 4, HandshakeTimeout: Duration(time.Second), DialTimeout: Duration(time.Second), DrainTimeout: Duration(2 * time.Second), UDPIdle: Duration(time.Second)}}
+	// Unrelated protocol fixtures use system localhost resolution, not public DNS.
+	c.DNS = &DNSOptions{Server: "system"}
 	// Existing end-to-end tests use loopback echo targets: allow them explicitly.
 	c.Security = &SecurityOptions{AllowLoopback: true}
 	if modify != nil {

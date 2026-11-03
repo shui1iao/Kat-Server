@@ -13,8 +13,10 @@
 package group
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -50,22 +52,23 @@ const (
 
 // Fixed parameters (design constants; not configurable).
 const (
-	maxMembers           = 64   // explicitly written members
-	maxExpandedMembers   = 1024 // after provider/include_all expansion
-	maxRelayMembers      = 4
-	defaultStickyTTL     = 10 * time.Minute
-	maxStickyTTL         = 24 * time.Hour
-	maxFailedTimesLimit  = 100
-	lbDefaultMaxFailed   = 5
-	maxAttempts          = 3 // members tried per connection before giving up
-	probeConcurrency     = 4
-	defaultInterval      = 10 * time.Minute // url-test / fallback
-	defaultSmartInterval = 5 * time.Minute
-	minInterval          = time.Second
-	defaultTimeout       = 5 * time.Second
-	maxTimeout           = 60 * time.Second
-	defaultTolerance     = 100 * time.Millisecond
-	maxPriority          = 100
+	maxMembers             = 64   // explicitly written members
+	maxExpandedMembers     = 1024 // after provider/include_all expansion
+	maxRelayMembers        = 4
+	defaultStickyTTL       = 10 * time.Minute
+	maxStickyTTL           = 24 * time.Hour
+	maxFailedTimesLimit    = 100
+	lbDefaultMaxFailed     = 5
+	maxAttempts            = 3 // members tried per connection before giving up
+	probeConcurrency       = 4
+	defaultInterval        = 10 * time.Minute // server fallback / load-balance
+	defaultURLTestInterval = time.Minute
+	defaultSmartInterval   = 5 * time.Minute
+	minInterval            = time.Second
+	defaultTimeout         = 5 * time.Second
+	maxTimeout             = 60 * time.Second
+	defaultTolerance       = 20 * time.Millisecond
+	maxPriority            = 100
 
 	urlTestFailWindow = 60 * time.Second // url-test: N real failures within this window ...
 	urlTestFailCount  = 3                // ... trigger an immediate re-test
@@ -75,23 +78,66 @@ const (
 
 // ProbeOptions configures active HTTP(S) probing.
 type ProbeOptions struct {
-	URL      string            `json:"url"`                // required (http/https); no built-in default
-	Interval outbound.Duration `json:"interval,omitempty"` // url-test/fallback default 10m; smart default 5m
-	Timeout  outbound.Duration `json:"timeout,omitempty"`  // default 5s, max 60s
+	// Prepare is supplied only by the runtime. It prepares cold nested/via/relay
+	// dependencies before a background probe reserves shared HTTP capacity.
+	Prepare func(context.Context, string) error `json:"-"`
+	// Desktop runtime-only semantics; not accepted from or emitted to server JSON.
+	ClientHead    bool              `json:"-"`
+	ClientUnified bool              `json:"-"`
+	URL           string            `json:"url"`                // required (http/https); no built-in default
+	Interval      outbound.Duration `json:"interval,omitempty"` // url-test default 1m; smart 5m; fallback/LB server 10m, desktop 5m
+	Timeout       outbound.Duration `json:"timeout,omitempty"`  // default 5s, max 60s
 	// ExpectedStatus restricts the HTTP statuses that count as success:
 	// "204", "200/204", "200-299/302" or "*". Empty = any status below 500.
 	ExpectedStatus string `json:"expected_status,omitempty"`
 }
 
 // Options is one entry of the root "groups" array.
+type DampingOptions struct {
+	RelativeImprovement *float64           `json:"relative_improvement,omitempty"`
+	ConfirmRounds       int                `json:"confirm_rounds,omitempty"`
+	MinDwell            *outbound.Duration `json:"min_dwell,omitempty"`
+}
+
+func (d *DampingOptions) UnmarshalJSON(b []byte) error {
+	type plain DampingOptions
+	var p plain
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if e := dec.Decode(&p); e != nil {
+		return e
+	}
+	var fields map[string]json.RawMessage
+	_ = json.Unmarshal(b, &fields)
+	if _, ok := fields["confirm_rounds"]; ok && (p.ConfirmRounds < 2 || p.ConfirmRounds > 5) {
+		return errors.New("damping.confirm_rounds must be 2..5")
+	}
+	*d = DampingOptions(p)
+	return nil
+}
+
+type SmartOptions struct {
+	Scope           string  `json:"scope,omitempty"`
+	ExplorationRate float64 `json:"exploration_rate,omitempty"`
+	AdaptiveDial    *bool   `json:"adaptive_dial,omitempty"`
+}
+
+// All automatic groups use stable selection; there is deliberately no legacy
+// algorithm switch. Preserve omitted vs explicit zero tolerance, including
+// mihomo's numeric millisecond spelling. Source bytes remain client-owned.
 type Options struct {
-	Name      string             `json:"name"`
-	Type      string             `json:"type"`                // select | url-test | fallback | smart
-	Members   []string           `json:"members,omitempty"`   // 1..64, unique
-	Selected  string             `json:"selected,omitempty"`  // select only
-	Probe     *ProbeOptions      `json:"probe,omitempty"`     // required for url-test/fallback/smart, forbidden for select
-	Tolerance outbound.Duration  `json:"tolerance,omitempty"` // url-test only, default 100ms
-	Priority  map[string]float64 `json:"priority,omitempty"`  // smart only; member name -> (0, 100], default 1
+	Icon         string             `json:"icon,omitempty"` // display only, never used for routing
+	Name         string             `json:"name"`
+	Type         string             `json:"type"`                // select | url-test | fallback | smart
+	Members      []string           `json:"members,omitempty"`   // 1..64, unique
+	Fixed        string             `json:"fixed,omitempty"`     // automatic types: persistent healthy-first preference
+	Selected     string             `json:"selected,omitempty"`  // select only
+	Probe        *ProbeOptions      `json:"probe,omitempty"`     // required for url-test/fallback/smart, forbidden for select
+	Tolerance    outbound.Duration  `json:"tolerance,omitempty"` // url-test / smart; numeric input is milliseconds
+	ToleranceSet bool               `json:"-"`
+	Damping      *DampingOptions    `json:"damping,omitempty"`
+	Smart        *SmartOptions      `json:"smart,omitempty"`
+	Priority     map[string]float64 `json:"priority,omitempty"` // smart/url-test; member name -> (0, 100], default 1
 
 	// load-balance only.
 	Strategy  string            `json:"strategy,omitempty"`   // round-robin | consistent-hashing (default) | sticky-sessions
@@ -102,8 +148,9 @@ type Options struct {
 	MaxFailedTimes int   `json:"max_failed_times,omitempty"` // real failures that trigger a re-test / mark a member down
 
 	// Dynamic members (expanded by the kernel; never valid for relay).
-	Use                 []string `json:"use,omitempty"`    // provider names
-	Filter              string   `json:"filter,omitempty"` // RE2 on member names; ` separates alternatives
+	IncludeGroup        string   `json:"include_group,omitempty"` // one source group; recursively include all effective leaves
+	Use                 []string `json:"use,omitempty"`           // provider names
+	Filter              string   `json:"filter,omitempty"`        // RE2 on member names; ` separates alternatives
 	ExcludeFilter       string   `json:"exclude_filter,omitempty"`
 	ExcludeType         string   `json:"exclude_type,omitempty"` // e.g. "shadowsocks|socks5"
 	IncludeAll          bool     `json:"include_all,omitempty"`
@@ -117,9 +164,58 @@ type Options struct {
 	ConfigDefault string `json:"-"`
 }
 
-// Dynamic reports whether the group takes members from providers or include_all*.
+func (o *Options) UnmarshalJSON(b []byte) error {
+	type plain Options
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(b, &fields); err != nil {
+		return err
+	}
+	tolerance, present := fields["tolerance"]
+	if present {
+		delete(fields, "tolerance")
+	}
+	rest, err := json.Marshal(fields)
+	if err != nil {
+		return err
+	}
+	dec := json.NewDecoder(bytes.NewReader(rest))
+	dec.DisallowUnknownFields()
+	var v plain
+	if err = dec.Decode(&v); err != nil {
+		return err
+	}
+	*o = Options(v)
+	o.ToleranceSet = present
+	if present {
+		if len(tolerance) > 0 && tolerance[0] == '"' {
+			return o.Tolerance.UnmarshalJSON(tolerance)
+		}
+		var n float64
+		if string(tolerance) == "null" || json.Unmarshal(tolerance, &n) != nil || math.IsNaN(n) || math.IsInf(n, 0) {
+			return errors.New("invalid tolerance")
+		}
+		o.Tolerance = outbound.Duration(n * float64(time.Millisecond))
+	}
+	return nil
+}
+func (o Options) MarshalJSON() ([]byte, error) {
+	type plain Options
+	b, e := json.Marshal(plain(o))
+	if e != nil {
+		return nil, e
+	}
+	if o.ToleranceSet && o.Tolerance == 0 {
+		var m map[string]json.RawMessage
+		_ = json.Unmarshal(b, &m)
+		m["tolerance"] = json.RawMessage(`"0s"`)
+		return json.Marshal(m)
+	}
+	return b, nil
+}
+
+// Dynamic reports whether the group takes members from a source group, providers or include_all*.
 func (o Options) Dynamic() bool {
-	return len(o.Use) > 0 || o.IncludeAll || o.IncludeAllProxies || o.IncludeAllProviders
+	return o.IncludeGroup != "" || len(o.Use) > 0 || o.IncludeAll || o.IncludeAllProxies || o.IncludeAllProviders
 }
 
 // Group is a policy group. It is an outbound.Outbound itself.
@@ -127,8 +223,8 @@ type Group interface {
 	outbound.Outbound
 	// Members returns the member names in configuration order.
 	Members() []string
-	// Current returns the group-level choice (smart: the group's current
-	// member; before any data: the first member).
+	// Current returns the group-level choice. Automatic Smart reports empty
+	// until its first successful full probe bootstrap; fixed remains explicit.
 	Current() string
 	// Start starts background probing (lazy for url-test/fallback). Probing
 	// stops when ctx ends or Close is called. Calling Start twice is a no-op.
@@ -148,16 +244,33 @@ type Snapshotter interface {
 // Snapshot is a point-in-time view of a group. It never contains destination
 // or client addresses.
 type Snapshot struct {
-	Name    string
-	Type    string
-	Current string
-	Members []MemberSnapshot
+	Name            string
+	Type            string
+	Current         string
+	Fixed           string
+	Members         []MemberSnapshot
+	SelectionMode   string
+	MostUsedMember  string
+	LearnedSites    int
+	Reason          string
+	Candidate       string
+	ConfirmProgress int
+	ConfirmRequired int
+	RemainingDwell  time.Duration
 }
 
 // MemberSnapshot describes one member. Fields not used by the group type are zero.
 type MemberSnapshot struct {
-	Name string
-	UDP  bool
+	Name             string
+	ScoreParts       ScoreParts
+	EffectiveSamples float64
+	SampleCount      int
+	SuccessRate      *float64
+	HealthState      string
+	CooldownUntil    time.Time
+	DecisionKnown    bool
+	DialLatency      time.Duration
+	UDP              bool
 	// Last probe round result (url-test / fallback / smart).
 	Probed       bool
 	ProbeOK      bool
@@ -167,7 +280,7 @@ type MemberSnapshot struct {
 	// consecutive real failures since the last success.
 	Failures int
 	// Smart only.
-	Latency  time.Duration // EWMA of probe latency and first-response time; 0 = no sample yet
+	Latency  time.Duration // decayed real transport-first-response mean; 0 = unknown
 	Penalty  time.Duration // failure penalty decayed to the snapshot time
 	Priority float64
 	Score    time.Duration // (latency or probe timeout when unknown) + penalty, times priority
@@ -180,26 +293,40 @@ func Validate(o Options) error {
 }
 
 type config struct {
-	name      string
-	kind      string
-	members   []string
-	selected  int
-	url       string
-	target    outbound.Addr
-	interval  time.Duration
-	timeout   time.Duration
-	tolerance time.Duration
-	priority  []float64
+	name         string
+	kind         string
+	members      []string
+	selected     int
+	fixed        string
+	fixedIndex   int
+	url          string
+	target       outbound.Addr
+	interval     time.Duration
+	timeout      time.Duration
+	tolerance    time.Duration
+	relative     float64
+	confirms     int
+	dwell        time.Duration
+	scope        string
+	exploration  float64
+	adaptiveDial bool
+	priority     []float64
 
 	strategy  string
 	stickyTTL time.Duration
 	lazy      bool
 	maxFailed int
+	head      bool
+	unified   bool
 	expected  func(int) bool // nil: status < 500
+	prepare   func(context.Context, string) error
 }
 
 func normalize(o Options) (config, error) {
-	var c config
+	if !ValidIcon(o.Icon) {
+		return config{}, errors.New("invalid group icon")
+	}
+	c := config{fixedIndex: -1}
 	fail := func(format string, a ...any) (config, error) {
 		return config{}, fmt.Errorf("group %q: "+format, append([]any{o.Name}, a...)...)
 	}
@@ -228,7 +355,7 @@ func normalize(o Options) (config, error) {
 		return fail("%v", err)
 	}
 	if !dynamic && (o.Filter != "" || o.ExcludeFilter != "" || o.ExcludeType != "") {
-		return fail("filter, exclude_filter and exclude_type need use or include_all*")
+		return fail("filter, exclude_filter and exclude_type need include_group, use or include_all*")
 	}
 	seenUse := map[string]bool{}
 	for _, u := range o.Use {
@@ -265,19 +392,33 @@ func normalize(o Options) (config, error) {
 		}
 		c.selected = i
 	}
-	if o.Tolerance != 0 && o.Type != TypeURLTest {
-		return fail("tolerance is only valid for url-test groups")
+	if o.Fixed != "" {
+		if o.Type != TypeSmart && o.Type != TypeURLTest && o.Type != TypeFallback && o.Type != TypeLoadBalance {
+			return fail("fixed is only valid for automatic groups")
+		}
+		c.fixed = o.Fixed
+		if i, ok := index[o.Fixed]; ok {
+			c.fixedIndex = i
+		} else if !dynamic {
+			return fail("fixed target is not a member")
+		}
 	}
-	if o.Tolerance < 0 {
-		return fail("tolerance must not be negative")
+	if (o.ToleranceSet || o.Tolerance != 0) && o.Type != TypeURLTest && o.Type != TypeSmart {
+		return fail("tolerance is only valid for url-test/smart groups")
 	}
-	if len(o.Priority) != 0 && o.Type != TypeSmart {
-		return fail("priority is only valid for smart groups")
+	if o.Tolerance < 0 || o.Tolerance.Value() > 5*time.Second {
+		return fail("tolerance must be in 0..5s")
+	}
+	if len(o.Priority) != 0 && o.Type != TypeSmart && o.Type != TypeURLTest {
+		return fail("priority is only valid for smart/url-test groups")
 	}
 	if (o.Strategy != "" || o.StickyTTL != 0) && o.Type != TypeLoadBalance {
 		return fail("strategy and sticky_ttl are only valid for load-balance groups")
 	}
 	if o.Type == TypeSelect {
+		if o.Damping != nil || o.Smart != nil {
+			return fail("damping/smart are only valid for automatic groups")
+		}
 		if o.Probe != nil {
 			return fail("probe is not valid for select groups")
 		}
@@ -320,11 +461,15 @@ func normalize(o Options) (config, error) {
 	switch {
 	case c.interval < 0 || (c.interval > 0 && c.interval < minInterval):
 		return fail("probe.interval must be at least %s", minInterval)
-	case c.interval == 0 && o.Type == TypeSmart:
+	case c.interval == 0 && o.Type == TypeURLTest:
+		c.interval = defaultURLTestInterval
+	case c.interval == 0 && (o.Type == TypeSmart || o.Probe.ClientHead):
 		c.interval = defaultSmartInterval
 	case c.interval == 0:
 		c.interval = defaultInterval
 	}
+	c.head, c.unified = o.Probe.ClientHead, o.Probe.ClientUnified
+	c.prepare = o.Probe.Prepare
 	c.timeout = o.Probe.Timeout.Value()
 	switch {
 	case c.timeout < 0 || c.timeout > maxTimeout:
@@ -355,7 +500,7 @@ func normalize(o Options) (config, error) {
 		c.maxFailed = lbDefaultMaxFailed
 	case TypeSmart:
 		if o.MaxFailedTimes != 0 {
-			return fail("max_failed_times is not valid for smart groups (fixed penalty model)")
+			return fail("max_failed_times is not valid for smart groups (v2 circuit and attribution)")
 		}
 	}
 	if o.MaxFailedTimes != 0 {
@@ -364,12 +509,51 @@ func normalize(o Options) (config, error) {
 		}
 		c.maxFailed = o.MaxFailedTimes
 	}
-	if o.Type == TypeURLTest {
+	c.tolerance = 50 * time.Millisecond
+	if o.Type == TypeURLTest || o.Type == TypeSmart {
+		c.tolerance = defaultTolerance
+	}
+	if o.ToleranceSet || o.Tolerance != 0 {
 		c.tolerance = o.Tolerance.Value()
-		if c.tolerance == 0 {
-			c.tolerance = defaultTolerance
+	}
+	c.relative, c.confirms, c.dwell = 0.2, 2, 60*time.Second
+	if o.Type == TypeURLTest || o.Type == TypeSmart {
+		c.relative, c.dwell = 0.1, 30*time.Second
+	}
+	if d := o.Damping; d != nil {
+		if d.RelativeImprovement != nil {
+			c.relative = *d.RelativeImprovement
+		}
+		if d.ConfirmRounds != 0 {
+			c.confirms = d.ConfirmRounds
+		}
+		if d.MinDwell != nil {
+			c.dwell = d.MinDwell.Value()
+		}
+		if math.IsNaN(c.relative) || math.IsInf(c.relative, 0) || c.relative < 0 || c.relative > 0.9 || c.confirms < 2 || c.confirms > 5 || c.dwell < 0 || c.dwell > 30*time.Minute {
+			return fail("invalid damping: relative_improvement 0..0.9, confirm_rounds 2..5, min_dwell 0..30m")
+		}
+		if o.Type == TypeFallback || o.Type == TypeLoadBalance {
+			return fail("performance damping fields apply only to url-test/smart; recovery is always enabled")
 		}
 	}
+	c.scope, c.adaptiveDial = "site", true
+	if v := o.Smart; v != nil {
+		if o.Type != TypeSmart {
+			return fail("smart is only valid for smart groups")
+		}
+		if v.Scope != "" {
+			c.scope = v.Scope
+		}
+		c.exploration = v.ExplorationRate
+		if v.AdaptiveDial != nil {
+			c.adaptiveDial = *v.AdaptiveDial
+		}
+		if (c.scope != "site" && c.scope != "group") || math.IsNaN(c.exploration) || math.IsInf(c.exploration, 0) || c.exploration < 0 || c.exploration > 0.05 {
+			return fail("smart.scope must be site/group; exploration_rate must be 0..0.05")
+		}
+	}
+
 	if o.Type == TypeLoadBalance {
 		c.strategy = o.Strategy
 		switch c.strategy {
@@ -390,7 +574,7 @@ func normalize(o Options) (config, error) {
 			return fail("sticky_ttl must be between 1s and %s", maxStickyTTL)
 		}
 	}
-	if o.Type == TypeSmart {
+	if o.Type == TypeSmart || o.Type == TypeURLTest {
 		c.priority = make([]float64, len(o.Members))
 		for i := range c.priority {
 			c.priority[i] = 1
@@ -415,9 +599,9 @@ func normalize(o Options) (config, error) {
 // normalizeRelay checks a relay group: 1..4 written members, nothing else.
 func normalizeRelay(o Options, fail func(string, ...any) (config, error)) (config, error) {
 	if o.Dynamic() || o.Filter != "" || o.ExcludeFilter != "" || o.ExcludeType != "" {
-		return fail("relay members must be written explicitly (no use, filter or include_all*)")
+		return fail("relay members must be written explicitly (no include_group, use, filter or include_all*)")
 	}
-	if o.Selected != "" || o.Probe != nil || o.Tolerance != 0 || len(o.Priority) != 0 || o.Strategy != "" || o.StickyTTL != 0 || o.Lazy != nil || o.MaxFailedTimes != 0 {
+	if o.Damping != nil || o.Smart != nil || o.ToleranceSet || o.Fixed != "" || o.Selected != "" || o.Probe != nil || o.Tolerance != 0 || len(o.Priority) != 0 || o.Strategy != "" || o.StickyTTL != 0 || o.Lazy != nil || o.MaxFailedTimes != 0 {
 		return fail("relay groups take only name, type and members")
 	}
 	if len(o.Members) == 0 || len(o.Members) > maxRelayMembers {
@@ -495,6 +679,7 @@ func memberFilter(o Options) (func(name, typ string) bool, error) {
 		}
 		return out, nil
 	}
+	o.Filter, o.ExcludeFilter = NormalizeFilters(o.Filter, o.ExcludeFilter)
 	inc, e := compile("filter", o.Filter)
 	if e != nil {
 		return nil, e
@@ -590,7 +775,7 @@ func newGroup(o Options, members []outbound.Outbound, events outbound.EventSink,
 		return &selectGroup{cfg: c, members: ms, events: events, sel: c.selected}, nil
 	}
 	if h.probe == nil {
-		h.probe = (&httpProber{url: c.url, target: c.target, tls: h.tls, clk: h.clk, expected: c.expected}).probe
+		h.probe = (&httpProber{url: c.url, target: c.target, tls: h.tls, clk: h.clk, expected: c.expected, head: c.head, unified: c.unified}).probe
 	}
 	return newAutoGroup(c, ms, events, h), nil
 }
@@ -616,4 +801,34 @@ type realClock struct{}
 func (realClock) Now() time.Time { return time.Now() }
 func (realClock) AfterFunc(d time.Duration, f func()) func() bool {
 	return time.AfterFunc(d, f).Stop
+}
+
+// Display metadata is bounded and never fetched by a group runtime.
+func ValidIcon(s string) bool {
+	if s == "" {
+		return true
+	}
+	if strings.HasPrefix(strings.TrimSpace(s), "<svg") {
+		return len(s) <= 64<<10
+	}
+	if len(s) > 2048 {
+		return false
+	}
+	u, e := url.Parse(s)
+	return e == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Hostname() != "" && u.User == nil
+}
+
+// Clash's common negative lookahead is representable as an exclusion in RE2.
+// The same normalization is used by import, runtime expansion and live preview.
+func NormalizeFilters(filter, exclude string) (string, string) {
+	if strings.HasPrefix(filter, "^(?!.*(") && strings.HasSuffix(filter, ")).*$") {
+		body := strings.TrimSuffix(strings.TrimPrefix(filter, "^(?!.*("), ")).*$")
+		if exclude != "" {
+			exclude = "(?:" + exclude + ")|(?:" + body + ")"
+		} else {
+			exclude = body
+		}
+		filter = ".*"
+	}
+	return filter, exclude
 }

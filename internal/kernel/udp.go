@@ -62,7 +62,7 @@ func (s *Server) resolve(ctx context.Context, a Address) (netip.AddrPort, error)
 	}
 	s.counters.Dials.Add(1)
 	defer func() { s.dialSlots.release(); s.counters.Dials.Add(-1) }()
-	ips, e := net.DefaultResolver.LookupNetIP(ctx, "ip", a.Host)
+	ips, e := s.lookup(ctx, a.Host)
 	if e != nil {
 		return netip.AddrPort{}, e
 	}

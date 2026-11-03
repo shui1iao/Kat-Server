@@ -1,6 +1,7 @@
 package route
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -94,12 +95,27 @@ func readLimited(path string, max int) ([]byte, os.FileInfo, error) {
 	if fi.Size() > int64(max) {
 		return nil, nil, errTooLarge
 	}
-	b, err := io.ReadAll(io.LimitReader(f, int64(max)+1))
+	// Stat is an allocation hint only; the same handle is still read to EOF
+	// through the original limit+1 guard, even if the file grows or shrinks.
+	hint := fi.Size()
+	if hint < 0 {
+		hint = 0
+	}
+	buf := bytes.NewBuffer(make([]byte, 0, int(hint)+bytes.MinRead))
+	_, err = buf.ReadFrom(io.LimitReader(f, int64(max)+1))
 	if err != nil {
 		return nil, nil, err
 	}
+	b := buf.Bytes()
 	if len(b) > max {
 		return nil, nil, errTooLarge
+	}
+	// A raced size change may grow or leave a mostly empty hinted buffer.
+	// Do not retain that spare allocation in an in-memory database reader.
+	if cap(b)-len(b) > bytes.MinRead {
+		compact := make([]byte, len(b))
+		copy(compact, b)
+		b = compact
 	}
 	return b, fi, nil
 }

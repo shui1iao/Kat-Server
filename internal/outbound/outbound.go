@@ -136,6 +136,7 @@ func (d Duration) Value() time.Duration         { return time.Duration(d) }
 // UDP defaults to enabled when the protocol (and chain) can carry it; an
 // explicit false disables UDP for this outbound.
 type Options struct {
+	FilterName   string      `json:"filter_name,omitempty"`
 	Name         string      `json:"name"`
 	Type         string      `json:"type"`
 	Server       string      `json:"server"`
@@ -241,4 +242,11 @@ func (o *TLSOptions) ClientConfig(defaultServerName string) (*tls.Config, error)
 		}
 	}
 	return c, nil
+}
+
+func (o Options) FilterLabel() string {
+	if o.FilterName != "" {
+		return o.FilterName
+	}
+	return o.Name
 }

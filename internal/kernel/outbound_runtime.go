@@ -146,6 +146,11 @@ func (s *Server) buildRouting() (*routingRuntime, error) {
 		for i, m := range g.Members {
 			members[i] = member{rt.nodes[m]}
 		}
+		if g.Probe != nil {
+			p := *g.Probe
+			p.Prepare = func(ctx context.Context, name string) error { return s.prepareProbeDependencies(ctx, rt, name) }
+			g.Probe = &p
+		}
 		gr, e := group.New(g, members, s.event)
 		if e != nil {
 			rt.close()
@@ -332,7 +337,7 @@ func (s *Server) dialProxy(parent context.Context, start time.Time, name string,
 	ctx, cancel := context.WithDeadline(parent, start.Add(l.DialTimeout.value()+l.HandshakeTimeout.value()))
 	defer cancel()
 	h := &hops{}
-	ctx = context.WithValue(ctx, hopsKey{}, h)
+	ctx = withHops(ctx, h)
 	c, e := s.rt.nodes[name].DialTCP(ctx, outbound.Addr{Host: host, Port: port})
 	if f := flowOf(parent); f != nil {
 		f.mu.Lock()

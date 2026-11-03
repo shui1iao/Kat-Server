@@ -20,46 +20,58 @@ type dnsCacheEntry struct {
 	expires time.Time
 }
 type internalDNS struct {
-	ep        dnsEndpoint
+	upstreams []*dnsUpstream
+	// Instance-local I/O seam; production always uses the ordinary direct dialer.
+	dial      func(context.Context, string, string) (net.Conn, error)
 	capacity  int
 	slots     chan struct{}
 	mu        sync.Mutex
 	cache     map[string]dnsCacheEntry
 	now       func() time.Time
 	bootstrap func(context.Context, string, string) ([]netip.Addr, error)
+}
+
+type dnsUpstream struct {
+	ep        dnsEndpoint
+	resolver  *internalDNS
 	transport *http.Transport
 	client    *http.Client
 }
 
 func newInternalDNS(o *DNSOptions) (*internalDNS, error) {
-	var ep dnsEndpoint
-	var e error
-	if o == nil {
-		ep.scheme = "system"
-	} else {
-		ep, e = parseDNS(o.Server)
-		if e != nil {
-			return nil, e
-		}
+	eps, e := dnsEndpoints(o)
+	if e != nil {
+		return nil, e
 	}
-	r := &internalDNS{ep: ep, capacity: 256, slots: make(chan struct{}, 64), cache: make(map[string]dnsCacheEntry), now: time.Now, bootstrap: net.DefaultResolver.LookupNetIP}
-	if ep.scheme == "system" {
+	r := &internalDNS{capacity: 256, slots: make(chan struct{}, 64), cache: make(map[string]dnsCacheEntry), now: time.Now, bootstrap: net.DefaultResolver.LookupNetIP, dial: (&net.Dialer{}).DialContext}
+	if len(eps) == 0 {
 		r.capacity = 0
 	}
 	if o != nil && o.CacheEntries != nil {
 		r.capacity = *o.CacheEntries
 	}
-	if ep.scheme == "https" {
-		// ProxyFromEnvironment is deliberately not used: this is a single configured upstream.
-		r.transport = &http.Transport{MaxConnsPerHost: 64, MaxIdleConns: 8, MaxIdleConnsPerHost: 8, IdleConnTimeout: 30 * time.Second, ResponseHeaderTimeout: 5 * time.Second, TLSHandshakeTimeout: 5 * time.Second, MaxResponseHeaderBytes: 8192, DisableCompression: true, ForceAttemptHTTP2: false}
-		r.transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) { return r.connect(ctx, "tcp") }
-		r.client = &http.Client{Transport: r.transport, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("DNS redirect rejected") }}
+	if r.capacity < 0 || r.capacity > 4096 || len(eps) == 0 && r.capacity != 0 {
+		return nil, errNetworkConfig
+	}
+	for _, ep := range eps {
+		u := &dnsUpstream{ep: ep, resolver: r}
+		if ep.scheme == "https" {
+			// No environment proxy or redirects; every endpoint owns its pool.
+			u.transport = &http.Transport{MaxConnsPerHost: 64, MaxIdleConns: 8, MaxIdleConnsPerHost: 8, IdleConnTimeout: 30 * time.Second, ResponseHeaderTimeout: 5 * time.Second, TLSHandshakeTimeout: 5 * time.Second, MaxResponseHeaderBytes: 8192, DisableCompression: true, ForceAttemptHTTP2: false}
+			u.transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) { return u.connect(ctx, "tcp") }
+			u.client = &http.Client{Transport: u.transport, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("DNS redirect rejected") }}
+		}
+		r.upstreams = append(r.upstreams, u)
 	}
 	return r, nil
 }
 func (r *internalDNS) close() {
-	if r != nil && r.transport != nil {
-		r.transport.CloseIdleConnections()
+	if r != nil {
+		for _, u := range r.upstreams {
+			if u.transport != nil {
+				u.transport.CloseIdleConnections()
+			}
+		}
 	}
 }
 func (r *internalDNS) cached(name string) ([]netip.Addr, bool) {
@@ -103,7 +115,10 @@ func (r *internalDNS) lookup(ctx context.Context, name string) ([]netip.Addr, er
 	if e != nil {
 		return nil, errDNS
 	}
-	if r.ep.scheme == "system" {
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if len(r.upstreams) == 0 {
 		return r.bootstrap(ctx, "ip", name)
 	}
 	if r.capacity > 0 {
@@ -124,10 +139,65 @@ func (r *internalDNS) lookup(ctx context.Context, name string) ([]netip.Addr, er
 	}
 	remaining := time.Until(deadline)
 	if remaining <= 0 {
-		return nil, ctx.Err()
+		return nil, context.DeadlineExceeded
 	}
+	// The complete chain (including system) gets half the remaining caller
+	// budget. Divide the current remainder equally among untried upstreams
+	// plus system, reusing time saved by fast failures. Never reset dial_timeout.
 	qctx, cancel := context.WithTimeout(ctx, remaining/2)
 	defer cancel()
+	end, _ := qctx.Deadline()
+	chainError := func() error {
+		if e := ctx.Err(); e != nil {
+			return e
+		}
+		if qctx.Err() != nil || !time.Now().Before(end) {
+			return errDNS
+		}
+		return nil
+	}
+	for i, u := range r.upstreams {
+		if e := chainError(); e != nil {
+			return nil, e
+		}
+		uctx, stop := context.WithTimeout(qctx, time.Until(end)/time.Duration(len(r.upstreams)-i+1))
+		ips, ttl, complete, terminal := u.lookup(uctx, name)
+		stop()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if len(ips) > 0 {
+			if complete {
+				r.cachePut(name, ips, ttl)
+			}
+			return ips, nil
+		}
+		if terminal {
+			return nil, errDNS
+		}
+	}
+	if e := chainError(); e != nil {
+		return nil, e
+	}
+	// System answers have no known TTL and must never enter our cache.
+	ips, e := r.bootstrap(qctx, "ip", name)
+	if e := chainError(); e != nil {
+		return nil, e
+	}
+	if len(ips) > maxDNSAddresses {
+		ips = ips[:maxDNSAddresses]
+	}
+	if e != nil {
+		return nil, e
+	}
+	if len(ips) == 0 {
+		return nil, errDNS
+	}
+	return ips, nil
+}
+
+// Families run concurrently, but results from different upstreams never mix.
+func (r *dnsUpstream) lookup(qctx context.Context, name string) (ips []netip.Addr, ttl time.Duration, complete, terminal bool) {
 	type result struct {
 		answer dnsAnswer
 		err    error
@@ -142,14 +212,18 @@ func (r *internalDNS) lookup(ctx context.Context, name string) ([]netip.Addr, er
 		}(i, typ)
 	}
 	wg.Wait()
-	var ips []netip.Addr
 	seen := map[netip.Addr]bool{}
-	complete := true
-	ttl := 300 * time.Second
+	complete = true
+	ttl = 300 * time.Second
+	nxdomain := false
 	for _, v := range results {
 		if v.err != nil {
 			complete = false
 			continue
+		}
+		if v.answer.nxdomain {
+			nxdomain = true
+			complete = false
 		}
 		if len(v.answer.ips) > 0 && v.answer.ttl < ttl {
 			ttl = v.answer.ttl
@@ -160,29 +234,25 @@ func (r *internalDNS) lookup(ctx context.Context, name string) ([]netip.Addr, er
 				seen[ip] = true
 				ips = append(ips, ip)
 				if len(ips) > maxDNSAddresses {
-					return nil, errDNS
+					return nil, 0, false, false
 				}
 			}
 		}
 	}
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
+	if len(ips) > 0 {
+		return ips, ttl, complete, false
 	}
-	if len(ips) == 0 {
-		return nil, errDNS
-	}
-	if complete {
-		r.cachePut(name, ips, ttl)
-	}
-	return ips, nil
+	// One valid NXDOMAIN is conclusive. NODATA is conclusive only if both
+	// families are valid empty answers; empty + transient may still have IPs.
+	return nil, 0, false, nxdomain || complete
 }
-func (r *internalDNS) connect(ctx context.Context, network string) (net.Conn, error) {
+func (r *dnsUpstream) connect(ctx context.Context, network string) (net.Conn, error) {
 	var ips []netip.Addr
 	if ip, e := netip.ParseAddr(r.ep.host); e == nil {
 		ips = []netip.Addr{ip}
 	} else {
 		var e error
-		ips, e = r.bootstrap(ctx, "ip", r.ep.host)
+		ips, e = r.resolver.bootstrap(ctx, "ip", r.ep.host)
 		if e != nil {
 			return nil, errDNS
 		}
@@ -191,7 +261,10 @@ func (r *internalDNS) connect(ctx context.Context, network string) (net.Conn, er
 		ips = ips[:16]
 	}
 	for _, ip := range ips {
-		c, e := (&net.Dialer{}).DialContext(ctx, network, net.JoinHostPort(ip.String(), r.ep.port))
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		c, e := r.resolver.dial(ctx, network, net.JoinHostPort(ip.String(), r.ep.port))
 		if e == nil {
 			return c, nil
 		}
@@ -201,7 +274,7 @@ func (r *internalDNS) connect(ctx context.Context, network string) (net.Conn, er
 	}
 	return nil, errDNS
 }
-func (r *internalDNS) query(ctx context.Context, name string, typ dnsmessage.Type) (dnsAnswer, error) {
+func (r *dnsUpstream) query(ctx context.Context, name string, typ dnsmessage.Type) (dnsAnswer, error) {
 	wire, q, e := dnsQuestion(name, typ)
 	if e != nil {
 		return dnsAnswer{}, errDNS
@@ -253,7 +326,7 @@ func (r *internalDNS) query(ctx context.Context, name string, typ dnsmessage.Typ
 	}
 	return a, nil
 }
-func (r *internalDNS) exchange(ctx context.Context, network string, wire []byte) ([]byte, error) {
+func (r *dnsUpstream) exchange(ctx context.Context, network string, wire []byte) ([]byte, error) {
 	c, e := r.connect(ctx, network)
 	if e != nil {
 		return nil, errDNS

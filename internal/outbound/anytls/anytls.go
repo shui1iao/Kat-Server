@@ -230,6 +230,7 @@ func (o *Outbound) Close() error {
 			kept = append(kept, s)
 		}
 	}
+	clear(o.sessions[len(kept):])
 	o.sessions = kept
 	o.mu.Unlock()
 	for _, s := range idle {
@@ -268,6 +269,9 @@ func (o *Outbound) open(ctx context.Context, target []byte, tcp bool) (*stream, 
 		}
 		e = st.await(ctx, tcp)
 		if e == nil {
+			// A nested AnyTLS hop may itself have reused a carrier. Propagate
+			// its actual route to the outer carrier rather than losing it.
+			s.recordRoute(ctx)
 			return st, nil
 		}
 		_ = st.Close()
@@ -285,8 +289,23 @@ func (o *Outbound) open(ctx context.Context, target []byte, tcp bool) (*stream, 
 // dials a new session. A session carries at most one active stream, so
 // concurrent dials never wait for each other.
 func (o *Outbound) acquire(ctx context.Context) (*session, bool, error) {
-	if s, e := o.pick(); s != nil || e != nil {
-		return s, false, e
+	for discarded := 0; discarded <= maxIdleSessions; discarded++ {
+		if err := ctx.Err(); err != nil {
+			return nil, false, err
+		}
+		s, e := o.pick()
+		if e != nil {
+			return nil, false, e
+		}
+		if s == nil {
+			break
+		}
+		// pick reserved an idle, exclusive session. Validate outside o.mu:
+		// group Current may emit events. Busy old streams are never touched.
+		if s.routeValid() {
+			return s, false, nil
+		}
+		s.fail(errSessionRouteChanged)
 	}
 	s, e := o.dialSession(ctx)
 	if e != nil {
@@ -356,6 +375,7 @@ func (o *Outbound) release(s *session) {
 }
 
 var errIdleClosed = errors.New("anytls: idle session closed")
+var errSessionRouteChanged = errors.New("anytls: carrier route changed")
 
 func (o *Outbound) removable(s *session) bool {
 	for _, x := range o.sessions {
@@ -406,7 +426,9 @@ func (o *Outbound) removeLocked(s *session) {
 	s.stopIdleLocked()
 	for i, x := range o.sessions {
 		if x == s {
-			o.sessions = append(o.sessions[:i], o.sessions[i+1:]...)
+			copy(o.sessions[i:], o.sessions[i+1:])
+			o.sessions[len(o.sessions)-1] = nil
+			o.sessions = o.sessions[:len(o.sessions)-1]
 			return
 		}
 	}
@@ -421,6 +443,8 @@ func (o *Outbound) removeSession(s *session) {
 // dialSession connects through under, completes TLS and sends the
 // authentication packet (packet 0). Settings ride with the first SYN.
 func (o *Outbound) dialSession(ctx context.Context) (*session, error) {
+	route := &sessionRoute{}
+	ctx = context.WithValue(ctx, sessionRouteKey{}, route)
 	raw, e := o.under.DialTCP(ctx, o.server)
 	if e != nil {
 		return nil, fmt.Errorf("anytls: dial server: %w", e)
@@ -447,6 +471,9 @@ func (o *Outbound) dialSession(ctx context.Context) (*session, error) {
 	}
 	settings := "v=2\nclient=kat\npadding-md5=" + scheme.md5
 	s := newSession(o, tc, scheme, appendFrame(nil, cmdSettings, 0, []byte(settings)))
+	route.mu.Lock()
+	s.route = append(s.route, route.checks...)
+	route.mu.Unlock()
 	o.sessionsCreated.Add(1)
 	s.start()
 	return s, nil

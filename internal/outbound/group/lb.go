@@ -96,13 +96,15 @@ func hrwScore(key, member string) uint64 {
 
 // lbUpLocked: healthy (see the package comment above).
 func (g *autoGroup) lbUpLocked(i int) bool {
-	s := g.st[i]
-	return (!s.probed || s.probeOK) && s.consec < g.cfg.maxFailed
+	return g.fallbackUpLocked(i)
 }
 
 // lbOrderLocked returns the candidate members for one connection (at most
 // maxAttempts). allowed restricts the members considered (nil = all).
 func (g *autoGroup) lbOrderLocked(src netip.Addr, key string, udp bool, now time.Time, allowed func(int) bool) []int {
+	if i, ok := g.fixedHealthyLocked(); ok && (!udp || g.members[i].UDP()) && (allowed == nil || allowed(i)) {
+		return []int{i}
+	}
 	var pool []int
 	for _, up := range []bool{true, false} {
 		for i := range g.st {
@@ -211,17 +213,35 @@ func (g *autoGroup) lbDialTCP(ctx context.Context, dst outbound.Addr) (net.Conn,
 		return nil, noMember(g.cfg.name, "TCP")
 	}
 	var errs []error
-	for _, i := range cands {
+	for attempt := 0; attempt < len(cands) && attempt < maxAttempts; attempt++ {
+		i := cands[attempt]
+		if attempt > 0 && !retryBudget(ctx) {
+			break
+		}
 		if ctx.Err() != nil {
 			break
 		}
 		c, err := g.members[i].DialTCP(ctx, dst)
 		if err == nil {
+			if isProbe(ctx) {
+				return c, nil
+			}
 			return wrapConn(c, g.newObserver(i, dst.Host)), nil
 		}
 		errs = append(errs, err)
-		if !isCanceled(ctx) {
+		if !isProbe(ctx) && !isCanceled(ctx) && !errors.Is(err, errProbeDependencyUnready) {
 			g.realFailure(i, dst.Host, false)
+		}
+		if attempt == 0 && len(cands) == 1 && ctx.Err() == nil {
+			g.mu.Lock()
+			if g.cfg.fixed == g.cfg.members[i] {
+				// fixed is a healthy-first preference, not a ban on TCP dial
+				// fallbacks. Do not run lbPick here: a temporary fallback must
+				// not publish its member as the group's persistent current.
+				backups := g.lbOrderLocked(outbound.SourceFrom(ctx), DestinationKey(dst.Host), false, g.clk.Now(), func(j int) bool { return j != i })
+				cands = append(cands, backups...)
+			}
+			g.unlock()
 		}
 	}
 	if len(errs) == 0 {
@@ -294,8 +314,15 @@ func (p *lbPacket) MemberFor(dst outbound.Addr) string {
 func (p *lbPacket) assign(key string) (int, bool) {
 	p.mu.Lock()
 	if i, ok := p.route[key]; ok {
-		p.mu.Unlock()
-		return i, true
+		p.g.mu.Lock()
+		fixed, healthy := p.g.fixedHealthyLocked()
+		keep := (p.g.cfg.fixed == "") || (healthy && i == fixed) || (!healthy && p.g.lbUpLocked(i))
+		p.g.mu.Unlock()
+		if keep {
+			p.mu.Unlock()
+			return i, true
+		}
+		delete(p.route, key)
 	}
 	full := len(p.subs) >= lbMaxSubs
 	open := map[int]bool{}
@@ -367,7 +394,9 @@ func (p *lbPacket) openSub(key string, first int) (*lbSub, error) {
 			return s, nil
 		}
 		errs = append(errs, err)
-		p.g.realFailure(i, "", false)
+		if !errors.Is(err, errProbeDependencyUnready) {
+			p.g.realFailure(i, "", false)
+		}
 		if len(errs) >= maxAttempts {
 			break
 		}
@@ -446,7 +475,7 @@ func (p *lbPacket) WriteTo(b []byte, dst outbound.Addr) (int, error) {
 	s.pc.SetWriteDeadline(wdl)
 	n, err := s.pc.WriteTo(b, dst)
 	if err != nil {
-		if !isDeadline(err) {
+		if !isDeadline(err) && !errors.Is(err, errProbeDependencyUnready) {
 			p.g.realFailure(s.i, dst.Host, false)
 		}
 		p.dropSub(s)

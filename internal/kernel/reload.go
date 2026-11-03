@@ -131,7 +131,11 @@ func (s *Server) current() *Server {
 }
 
 // CurrentConfig returns the configuration of the running generation.
-func (s *Server) CurrentConfig() Config { return s.current().cfg }
+func (s *Server) CurrentConfig() Config {
+	c := s.current().cfg
+	c.DNS = cloneDNSOptions(c.DNS)
+	return c
+}
 
 // prepareError reports the stage at which a start or reload failed.
 type prepareError struct {
@@ -183,6 +187,10 @@ func (p *plan) abort() {
 // prepare builds generation c without changing the running state. The
 // caller holds reloadMu (or is Start).
 func (k *core) prepare(c Config, prev *Server) (*Server, *plan, error) {
+	return k.prepareContext(context.Background(), c, prev)
+}
+func (k *core) prepareContext(ctx context.Context, c Config, prev *Server) (*Server, *plan, error) {
+	c.DNS = cloneDNSOptions(c.DNS)
 	g := &Server{core: k, cfg: c, id: k.genSeq.Add(1)}
 	g.refs.Store(1)
 	l := c.Limits
@@ -198,6 +206,9 @@ func (k *core) prepare(c Config, prev *Server) (*Server, *plan, error) {
 		g.dns.close()
 		return nil, nil, &prepareError{stage, e}
 	}
+	if e := ctx.Err(); e != nil {
+		return fail("canceled", e)
+	}
 	dns, e := newInternalDNS(c.DNS)
 	if e != nil {
 		return fail("dns", e)
@@ -208,6 +219,12 @@ func (k *core) prepare(c Config, prev *Server) (*Server, *plan, error) {
 		return fail("routing", e)
 	}
 	g.rt = rt
+	if prev != nil {
+		g.inheritGroupLearning(prev)
+	}
+	if e := ctx.Err(); e != nil {
+		return fail("canceled", e)
+	}
 	p.sel, p.selLog = k.applySelections(g)
 	if e := g.prepareAnyTLS(prev); e != nil {
 		return fail("inbound", e)
@@ -227,6 +244,9 @@ func (k *core) prepare(c Config, prev *Server) (*Server, *plan, error) {
 	seen := map[string]bool{}
 	ephemeral := map[string]int{}
 	for i := range g.cfg.Inbounds {
+		if e := ctx.Err(); e != nil {
+			return fail("canceled", e)
+		}
 		in := &g.cfg.Inbounds[i]
 		in.logIndex = i
 		key := listenKey(in.Listen)
@@ -309,7 +329,11 @@ func logSinkChanged(a, b *LogOptions) bool {
 }
 
 // commit installs prepared generation g. The caller holds reloadMu.
-func (k *core) commit(g *Server, p *plan) error {
+func (k *core) commit(g *Server, p *plan) error { return k.commitContext(context.Background(), g, p) }
+func (k *core) commitContext(ctx context.Context, g *Server, p *plan) error {
+	if e := ctx.Err(); e != nil {
+		return e
+	}
 	// The last fallible operations happen before any generation/binding changes.
 	if p.state != nil {
 		if e := p.state.install(); e != nil {
@@ -517,12 +541,67 @@ func (s *Server) SetConfigLoader(load func() (Config, error)) {
 func (s *Server) Reload(trigger string) (ReloadResult, error) { return s.reload(trigger, true) }
 
 func (s *Server) reload(trigger string, reread bool) (ReloadResult, error) {
+	return s.reloadCandidate(trigger, reread, nil)
+}
+func (s *Server) reloadCandidate(trigger string, reread bool, candidate *Config) (ReloadResult, error) {
+	return s.reloadCandidateContext(context.Background(), trigger, reread, candidate)
+}
+func (s *Server) reloadCandidateContext(ctx context.Context, trigger string, reread bool, candidate *Config) (ReloadResult, error) {
+	if e := ctx.Err(); e != nil {
+		return ReloadResult{}, e
+	}
 	k := s.core
 	k.reloadMu.Lock()
 	defer k.reloadMu.Unlock()
+	return s.reloadCandidateLockedContext(ctx, trigger, reread, candidate, nil)
+}
+func (s *Server) reloadProvider(ctx context.Context, q *providerCandidate) (ReloadResult, error) {
+	k := s.core
+	k.reloadMu.Lock()
+	defer k.reloadMu.Unlock()
+	if ctx.Err() != nil {
+		return ReloadResult{}, ctx.Err()
+	}
+	k.provMu.Lock()
+	active := k.providers[q.p.cfg.Name]
+	k.provMu.Unlock()
+	if active != q.p || active.key != q.p.key {
+		return ReloadResult{}, errors.New("provider_stale")
+	}
+	k.mu.Lock()
+	closing := k.closing
+	k.mu.Unlock()
+	if closing {
+		return ReloadResult{}, errors.New("provider_stopped")
+	}
+	q.ctx = ctx
+	q.p.mu.Lock()
+	same := q.p.loaded && q.p.hash == q.hash
+	q.p.mu.Unlock()
+	if same {
+		q.accept()
+		return ReloadResult{OK: true, Generation: k.gen.Load().id}, nil
+	}
+	return s.reloadCandidateLocked("provider", false, nil, q)
+}
+func (s *Server) reloadCandidateLocked(trigger string, reread bool, candidate *Config, q *providerCandidate) (ReloadResult, error) {
+	ctx := context.Background()
+	if q != nil && q.ctx != nil {
+		ctx = q.ctx
+	}
+	return s.reloadCandidateLockedContext(ctx, trigger, reread, candidate, q)
+}
+func (s *Server) reloadCandidateLockedContext(ctx context.Context, trigger string, reread bool, candidate *Config, q *providerCandidate) (ReloadResult, error) {
+	if e := ctx.Err(); e != nil {
+		return ReloadResult{}, e
+	}
+	k := s.core
 	start := time.Now()
 	res := ReloadResult{At: start, Trigger: trigger}
 	failWith := func(stage string, e error) (ReloadResult, error) {
+		if q != nil {
+			e = errors.New("provider_candidate_failed")
+		}
 		res.Stage, res.Error, res.DurationMS = stage, e.Error(), time.Since(start).Milliseconds()
 		k.reloadFailures.Add(1)
 		k.lastReload.Store(&res)
@@ -538,7 +617,9 @@ func (s *Server) reload(trigger string, reread bool) (ReloadResult, error) {
 	prev := k.gen.Load()
 	var c Config
 	var e error
-	if reread {
+	if candidate != nil {
+		c = *candidate
+	} else if reread {
 		if k.loader == nil {
 			return failWith("load", errors.New("reload is not available"))
 		}
@@ -568,13 +649,20 @@ func (s *Server) reload(trigger string, reread bool) (ReloadResult, error) {
 		return failWith("validate", e)
 	}
 	prov := k.syncProviders(&c, reread)
-	prov.notes = append(prov.notes, expandProviders(&c, prov.next)...)
+	if prov.err != nil {
+		return failWith("provider", prov.err)
+	}
+	notes, err := expandProviderCandidate(&c, prov.next, q)
+	if err != nil {
+		return failWith("provider", err)
+	}
+	prov.notes = append(prov.notes, notes...)
 	if e = c.Validate(); e != nil {
 		return failWith("validate", e)
 	}
-	g, p, e := k.prepare(c, prev)
+	g, p, e := k.prepareContext(ctx, c, prev)
 	if e == nil {
-		e = k.commit(g, p)
+		e = k.commitContext(ctx, g, p)
 		if e != nil {
 			p.abort()
 			g.rt.close()
@@ -593,6 +681,9 @@ func (s *Server) reload(trigger string, reread bool) (ReloadResult, error) {
 			e = pe.err
 		}
 		return failWith(stage, e)
+	}
+	if q != nil {
+		q.accept()
 	}
 	k.installProviders(prov)
 	res.OK, res.Generation, res.DurationMS = true, g.id, time.Since(start).Milliseconds()

@@ -409,3 +409,9 @@ func (p *packetConn) Close() error {
 
 func (p *packetConn) SetReadDeadline(t time.Time) error  { return p.pc.SetReadDeadline(t) }
 func (p *packetConn) SetWriteDeadline(t time.Time) error { return p.pc.SetWriteDeadline(t) }
+
+// IsProxyFailure recognizes only typed/sentinel authentication or malformed proxy replies.
+// Destination rejection and ambiguous EOF/timeouts deliberately do not match.
+func IsProxyFailure(err error) bool {
+	return errors.Is(err, errAuthRejected) || errors.Is(err, errNoMethod) || errors.Is(err, errProtocol)
+}

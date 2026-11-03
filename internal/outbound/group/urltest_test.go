@@ -11,7 +11,7 @@ import (
 
 const ms_ = time.Millisecond
 
-func TestURLTestFirstUseUsesFirstMemberAndProbes(t *testing.T) {
+func TestURLTestFirstUseWaitsForCompleteRound(t *testing.T) {
 	clk := newFakeClock()
 	a, b, c := newFake("a"), newFake("b"), newFake("c")
 	p := newFakeProbe(map[string]time.Duration{"a": 300 * ms_, "b": 80 * ms_, "c": 150 * ms_})
@@ -22,14 +22,28 @@ func TestURLTestFirstUseUsesFirstMemberAndProbes(t *testing.T) {
 	if isProbing(g) || g.Current() != "a" {
 		t.Fatalf("before use: probing=%v current=%q", isProbing(g), g.Current())
 	}
-	// first use: first member, probe starts in the background
-	if got := dial(t, g, "x.test"); got != "a" {
-		t.Fatalf("first dial via %q, want a", got)
+	// Cold first use waits; no unprobed member may get application bytes.
+	result := make(chan string, 1)
+	go func() { result <- dial(t, g, "x.test") }()
+	deadline := time.Now().Add(time.Second)
+	for !isProbing(g) {
+		if time.Now().After(deadline) {
+			t.Fatal("first round not started")
+		}
+		time.Sleep(time.Millisecond)
 	}
-	if !isProbing(g) {
-		t.Fatal("first use did not start a probe round")
+	select {
+	case <-result:
+		t.Fatal("cold dial did not wait")
+	default:
+	}
+	if a.dialCount()+b.dialCount()+c.dialCount() != 0 {
+		t.Fatal("cold dial touched unprobed member")
 	}
 	close(p.block)
+	if got := <-result; got != "b" {
+		t.Fatal("first dial did not use complete round winner")
+	}
 	waitRounds(t, g, 1)
 	if g.Current() != "b" || dial(t, g, "x.test") != "b" {
 		t.Fatalf("after probe current = %q, want lowest-latency b", g.Current())
@@ -43,31 +57,20 @@ func TestURLTestFirstUseUsesFirstMemberAndProbes(t *testing.T) {
 }
 
 func TestURLTestTolerance(t *testing.T) {
-	clk := newFakeClock()
-	a, b := newFake("a"), newFake("b")
-	p := newFakeProbe(map[string]time.Duration{"a": 200 * ms_, "b": 250 * ms_})
-	g := newAuto(t, Options{Type: TypeURLTest}, members(a, b), clk, p, nil) // tolerance default 100ms
-	g.Start(context.Background())
-	dial(t, g, "x.test")
-	waitRounds(t, g, 1)
-	if g.Current() != "a" {
-		t.Fatalf("current %q", g.Current())
+	g, c := v2Group(t, TypeURLTest)
+	v2Round(g, c, 200*ms_, 250*ms_)
+	c.Advance(time.Minute)
+	for range 4 {
+		v2Round(g, c, 200*ms_, 180*ms_)
 	}
-	// b becomes faster, but only by 50ms (< 100ms tolerance): stay on a
-	p.set("b", 150*ms_, false)
-	clk.Advance(11 * time.Minute)
-	dial(t, g, "x.test")
-	waitRounds(t, g, 2)
 	if g.Current() != "a" {
-		t.Fatalf("switched within tolerance: current %q", g.Current())
+		t.Fatal("strict 20ms tolerance boundary")
 	}
-	// b faster by 110ms (> tolerance): switch
-	p.set("b", 90*ms_, false)
-	clk.Advance(11 * time.Minute)
-	dial(t, g, "x.test")
-	waitRounds(t, g, 3)
+	for range 4 {
+		v2Round(g, c, 200*ms_, 170*ms_)
+	}
 	if g.Current() != "b" {
-		t.Fatalf("not switched beyond tolerance: current %q", g.Current())
+		t.Fatal("sustained improvement not promoted")
 	}
 }
 
@@ -152,7 +155,8 @@ func TestURLTestThreeDialFailuresIn60sRetest(t *testing.T) {
 	clk := newFakeClock()
 	a, b := newFake("a"), newFake("b")
 	p := newFakeProbe(map[string]time.Duration{"a": 50 * ms_, "b": 100 * ms_})
-	g := newAuto(t, Options{Type: TypeURLTest}, members(a, b), clk, p, nil)
+	// Isolate the 60s real-failure window from the new 60s periodic default.
+	g := newAuto(t, Options{Type: TypeURLTest, Probe: &ProbeOptions{URL: "http://probe.test/", Interval: outbound.Duration(10 * time.Minute)}}, members(a, b), clk, p, nil)
 	g.Start(context.Background())
 	dial(t, g, "x.test")
 	waitRounds(t, g, 1)

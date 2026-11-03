@@ -90,6 +90,7 @@ func (o *OutboundConfig) UnmarshalJSON(b []byte) error {
 	*o = OutboundConfig(p)
 	return nil
 }
+func (o GroupConfig) MarshalJSON() ([]byte, error) { return json.Marshal(group.Options(o)) }
 func (o *GroupConfig) UnmarshalJSON(b []byte) error {
 	var p group.Options
 	if e := strictPlain(b, &p); e != nil {
@@ -217,6 +218,9 @@ func (c *Config) validateOutbounds() error {
 	kind := map[string]byte{} // 'o' outbound, 'g' group
 	for i := range c.Outbounds {
 		o := outbound.Options(c.Outbounds[i])
+		if len(o.FilterName) > 4096 {
+			return errors.New("filter name metadata too long")
+		}
 		nameOK := validOutboundName(o.Name)
 		if i >= len(c.Outbounds)-c.providerNodes {
 			nameOK = validProviderNodeName(o.Name)
@@ -283,7 +287,7 @@ func (c *Config) validateOutbounds() error {
 			}
 		}
 	}
-	// Dependency graph: outbound -> via, group -> members. Detect cycles and
+	// Dependency graph: outbound -> via, group -> members + include_group. Detect cycles and
 	// measure the proxy-hop chain depth.
 	edges := map[string][]string{}
 	for _, o := range c.Outbounds {
@@ -292,6 +296,12 @@ func (c *Config) validateOutbounds() error {
 		}
 	}
 	for _, g := range c.Groups {
+		if g.IncludeGroup != "" {
+			if kind[g.IncludeGroup] != 'g' {
+				return fmt.Errorf("group %q: unknown source group %q", g.Name, g.IncludeGroup)
+			}
+			edges[g.Name] = append(edges[g.Name], g.IncludeGroup)
+		}
 		for _, m := range g.Members {
 			if m != "direct" && m != "reject" {
 				edges[g.Name] = append(edges[g.Name], m)
@@ -343,6 +353,9 @@ func (c *Config) validateOutbounds() error {
 		if e := visit(g.Name); e != nil {
 			return e
 		}
+	}
+	if e := validateSourceGroups(c.Groups); e != nil {
+		return e
 	}
 	ro := c.routeOptions()
 	if e := ro.Validate(); e != nil {

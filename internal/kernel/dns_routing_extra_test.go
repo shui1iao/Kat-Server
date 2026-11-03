@@ -102,6 +102,7 @@ func TestDNSRoutingActualSystemBootstrapLocalhost(t *testing.T) {
 	}()
 	defer func() { v6.Close(); wg.Wait() }()
 	r := configuredDNS(t, "localhost:"+itoaPort(uint16(f.tcp.Addr().(*net.TCPAddr).Port)), 0)
+	r.bootstrap = net.DefaultResolver.LookupNetIP
 	if _, e = lookupDNS(t, r, "bootstrap-target.example"); e != nil {
 		t.Fatal("real system bootstrap for upstream hostname failed", e)
 	}
@@ -127,7 +128,7 @@ func TestDNSRoutingDoHCloseAndCancellation(t *testing.T) {
 	r := configuredDNS(t, h.URL+"/dns-query", 0)
 	pool := x509.NewCertPool()
 	pool.AddCert(h.Certificate())
-	r.transport.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	r.upstreams[0].transport.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
 	if _, e := lookupDNS(t, r, "close.example"); e != nil {
 		t.Fatal(e)
 	}
@@ -144,7 +145,7 @@ func TestDNSRoutingDoHCloseAndCancellation(t *testing.T) {
 	d := configuredDNS(t, stuck.URL+"/dns-query", 0)
 	roots := x509.NewCertPool()
 	roots.AddCert(stuck.Certificate())
-	d.transport.TLSClientConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
+	d.upstreams[0].transport.TLSClientConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
 	ctx, cancel := context.WithCancel(context.Background())
 	ctx, timeout := context.WithTimeout(ctx, time.Second)
 	defer timeout()

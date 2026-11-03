@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-const version = "0.7.1"
+const version = "0.7.2"
 
 const usage = `usage:
   kat check CONFIG.json

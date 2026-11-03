@@ -147,6 +147,7 @@ func configuredDNS(t *testing.T, server string, cache int) *internalDNS {
 	if e != nil {
 		t.Fatal(e)
 	}
+	r.bootstrap = func(context.Context, string, string) ([]netip.Addr, error) { return nil, errDNS }
 	t.Cleanup(r.close)
 	return r
 }
@@ -225,7 +226,7 @@ func TestDNSRoutingTransportsBootstrapCache(t *testing.T) {
 	if _, e := lookupDNS(t, r, "business.example"); e != nil || bootstrap.Load() != 2 {
 		t.Fatal("domain upstream bootstrap", e, bootstrap.Load())
 	}
-	system, _ := newInternalDNS(nil)
+	system, _ := newInternalDNS(&DNSOptions{Server: "system"})
 	if system.capacity != 0 {
 		t.Fatal("system cache changed")
 	}
@@ -320,17 +321,23 @@ func TestDNSRoutingDoHCertificateAndErrors(t *testing.T) {
 	}
 	roots := x509.NewCertPool()
 	roots.AddCert(h.Certificate())
-	r.transport.TLSClientConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
+	// Fresh resolver: never mutate a Transport while a canceled sibling TLS dial may still run.
+	r = configuredDNS(t, h.URL+"/dns-query", 0)
+	r.upstreams[0].transport.TLSClientConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
 	if _, e := lookupDNS(t, r, "doh.example"); e != nil {
 		t.Fatal("trusted DoH failed", e)
 	}
-	r.transport.CloseIdleConnections()
-	r.transport.TLSClientConfig = &tls.Config{RootCAs: roots, ServerName: "wrong.example", MinVersion: tls.VersionTLS12}
+	r.upstreams[0].transport.CloseIdleConnections()
+	// Fresh resolver: never mutate a Transport while a canceled sibling TLS dial may still run.
+	r = configuredDNS(t, h.URL+"/dns-query", 0)
+	r.upstreams[0].transport.TLSClientConfig = &tls.Config{RootCAs: roots, ServerName: "wrong.example", MinVersion: tls.VersionTLS12}
 	if _, e := lookupDNS(t, r, "doh.example"); e == nil {
 		t.Fatal("hostname check bypassed")
 	}
-	r.transport.CloseIdleConnections()
-	r.transport.TLSClientConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
+	r.upstreams[0].transport.CloseIdleConnections()
+	// Fresh resolver: never mutate a Transport while a canceled sibling TLS dial may still run.
+	r = configuredDNS(t, h.URL+"/dns-query", 0)
+	r.upstreams[0].transport.TLSClientConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
 	for i := int32(1); i <= 4; i++ {
 		mode.Store(i)
 		if _, e := lookupDNS(t, r, "doh.example"); e == nil {
@@ -479,7 +486,7 @@ func TestDNSRoutingOrderedRulesAndLiteralTCPUDP(t *testing.T) {
 	t.Logf("custom resolver used for literal TCP and SS native UDP; DNS queries=%d", dns.count.Load())
 }
 
-func TestDNSRoutingRejectUDPWhitelistAndNoFallback(t *testing.T) {
+func TestDNSRoutingRejectUDPWhitelistAndSystemFallback(t *testing.T) {
 	queries := newDNSFixture(t, func(w []byte) []byte { return dnsReply(w, []string{"127.0.0.1"}, 30) })
 	u := localUDP(t)
 	s := startTest(t, ssIn(), func(c *Config) {
@@ -528,8 +535,8 @@ func TestDNSRoutingRejectUDPWhitelistAndNoFallback(t *testing.T) {
 		system.Add(1)
 		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
 	}
-	if _, e := lookupDNS(t, r, "localhost"); e == nil || system.Load() != 0 {
-		t.Fatal("custom failure used system business DNS", e, system.Load())
+	if _, e := lookupDNS(t, r, "localhost"); e != nil || system.Load() != 1 {
+		t.Fatal("custom failure did not use system exactly once", e, system.Load())
 	}
 }
 
@@ -607,7 +614,7 @@ func TestDNSRoutingPartialFamilyRealTCPUDP(t *testing.T) {
 	}
 }
 
-func TestDNSRoutingRepresentativeAnyTLSSSTCPAndDefault(t *testing.T) {
+func TestDNSRoutingRepresentativeAnyTLSSSTCPAndExplicitSystem(t *testing.T) {
 	f := newDNSFixture(t, func(w []byte) []byte { return dnsReply(w, []string{"127.0.0.1"}, 30) })
 	target := echoTCP(t)
 	cert, roots := testCert(t)
@@ -632,14 +639,14 @@ func TestDNSRoutingRepresentativeAnyTLSSSTCPAndDefault(t *testing.T) {
 	raw.Close()
 	old := startTest(t, inFor("socks5", nil), nil)
 	if old.networkPolicy() || old.dns.capacity != 0 {
-		t.Fatal("no-block defaults changed")
+		t.Fatal("explicit system fast path changed")
 	}
 	direct, e := old.dial(context.Background(), Address{"localhost", target.Port})
 	if e != nil {
-		t.Fatal("system default TCP", e)
+		t.Fatal("explicit system TCP", e)
 	}
 	direct.Close()
 	if _, e = old.resolve(context.Background(), Address{"localhost", target.Port}); e != nil {
-		t.Fatal("system default UDP resolution", e)
+		t.Fatal("explicit system UDP resolution", e)
 	}
 }

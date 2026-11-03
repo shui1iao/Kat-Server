@@ -15,6 +15,7 @@ import (
 
 	"github.com/shui1iao/Kat/internal/outbound"
 	"github.com/shui1iao/Kat/internal/outbound/direct"
+	"github.com/shui1iao/Kat/internal/outbound/group"
 	"github.com/shui1iao/Kat/internal/route"
 	"github.com/shui1iao/Kat/internal/stats"
 )
@@ -97,6 +98,27 @@ func (h *hops) chain(head string) []string {
 	return out
 }
 
+// Each speculative dial has its own hop list; only the winner commits.
+func withHops(ctx context.Context, h *hops) context.Context {
+	ctx = context.WithValue(ctx, hopsKey{}, h)
+	return group.WithBranchFork(ctx, func(parent context.Context) (context.Context, func()) {
+		target, _ := parent.Value(hopsKey{}).(*hops)
+		branch := &hops{}
+		child := withHops(parent, branch)
+		return child, func() {
+			if target == nil {
+				return
+			}
+			branch.mu.Lock()
+			names := append([]string(nil), branch.names...)
+			branch.mu.Unlock()
+			target.mu.Lock()
+			target.names = append(target.names, names...)
+			target.mu.Unlock()
+		}
+	})
+}
+
 // underlay is the dialer given to a protocol outbound for its own server
 // connection ("via"). It removes the client mark and the hop recorder: that
 // dial is configured by the operator, not chosen by the client.
@@ -109,7 +131,7 @@ func strip(ctx context.Context) context.Context {
 	return ctx
 }
 func (u underlay) DialTCP(ctx context.Context, dst outbound.Addr) (net.Conn, error) {
-	return u.d.DialTCP(strip(ctx), dst)
+	return dialCarrier(strip(ctx), u.d, dst)
 }
 func (u underlay) ListenPacket(ctx context.Context) (outbound.PacketConn, error) {
 	return u.d.ListenPacket(strip(ctx))
@@ -119,14 +141,36 @@ func (u underlay) UDP() bool { return u.d.UDP() }
 // member wraps a group member so that the chosen member is recorded.
 type member struct{ outbound.Outbound }
 
+// Keep nested health visible across the tracking wrapper without treating an
+// ordinary leaf as inherently healthy or changing its own probe record.
+func (m member) ClientGroupHealth() (bool, time.Time, bool) {
+	if g, ok := m.Outbound.(interface{ ClientHealth() (bool, time.Time) }); ok {
+		a, t := g.ClientHealth()
+		return a, t, true
+	}
+	return false, time.Time{}, false
+}
+func (m member) ClientGroupAlive() (bool, bool) {
+	if g, ok := m.Outbound.(interface{ ClientAlive() bool }); ok {
+		return g.ClientAlive(), true
+	}
+	return false, false
+}
+
 func (m member) record(ctx context.Context) {
 	if h, _ := ctx.Value(hopsKey{}).(*hops); h != nil {
 		h.add(m.Name())
 	}
 }
 func (m member) DialTCP(ctx context.Context, dst outbound.Addr) (net.Conn, error) {
-	c, e := m.Outbound.DialTCP(ctx, dst)
+	parent, _ := ctx.Value(carrierChoiceKey{}).(*carrierChoice)
+	c, e := dialCarrier(ctx, m.Outbound, dst)
 	if e == nil {
+		if parent != nil {
+			parent.mu.Lock()
+			parent.name = m.Name()
+			parent.mu.Unlock()
+		}
 		m.record(ctx)
 	}
 	return c, e

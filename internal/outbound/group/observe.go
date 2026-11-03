@@ -24,9 +24,15 @@ import (
 // A connection that is closed by its owner before any of these happens
 // reports nothing. Observation never changes what the caller sees.
 type observer struct {
-	clk     clock
-	noReply time.Duration
-	report  func(ok bool, ttfb time.Duration, hasTTFB bool)
+	onError    func(error)
+	onDone     func()
+	release    sync.Once
+	clk        clock
+	noReply    time.Duration
+	lateWindow time.Duration
+	timedOut   bool
+	notifyMu   sync.Mutex
+	report     func(ok bool, ttfb time.Duration, hasTTFB bool)
 
 	done atomic.Bool // fast path once reported or closed
 
@@ -53,6 +59,9 @@ func (o *observer) beforeWrite(n int) {
 
 func (o *observer) afterWrite(err error) {
 	if err != nil && !o.done.Load() && !isDeadline(err) {
+		if o.onError != nil {
+			o.onError(err)
+		}
 		o.finish(false)
 	}
 }
@@ -70,20 +79,35 @@ func (o *observer) afterRead(n int, err error) {
 		wrote := o.wrote
 		o.mu.Unlock()
 		if wrote {
+			if o.onError != nil {
+				o.onError(err)
+			}
 			o.finish(false)
 		}
 	}
 }
 
 func (o *observer) finish(ok bool) {
+	o.notifyMu.Lock()
+	defer o.notifyMu.Unlock()
 	o.mu.Lock()
-	if o.closed || o.done.Load() {
+	if o.closed || o.done.Load() || (!ok && o.timedOut) {
 		o.mu.Unlock()
 		return
 	}
-	o.done.Store(true)
 	if o.stop != nil {
 		o.stop()
+	}
+	if !ok && o.lateWindow > 0 {
+		o.timedOut = true
+		remaining := o.lateWindow - o.clk.Now().Sub(o.wroteAt)
+		if remaining > 0 {
+			o.stop = o.clk.AfterFunc(remaining, func() { o.markDone() })
+		} else {
+			o.markDone()
+		}
+	} else {
+		o.markDone()
 	}
 	has, ttfb := o.wrote, time.Duration(0)
 	if has {
@@ -93,13 +117,22 @@ func (o *observer) finish(ok bool) {
 	o.report(ok, ttfb, ok && has)
 }
 
+func (o *observer) markDone() {
+	o.done.Store(true)
+	o.release.Do(func() {
+		if o.onDone != nil {
+			o.onDone()
+		}
+	})
+}
+
 func (o *observer) close() {
 	o.mu.Lock()
 	o.closed = true
 	if o.stop != nil {
 		o.stop()
 	}
-	o.done.Store(true)
+	o.markDone()
 	o.mu.Unlock()
 }
 
@@ -173,9 +206,17 @@ type obsPacket struct {
 
 func (p *obsPacket) WriteTo(b []byte, dst outbound.Addr) (int, error) {
 	n, err := p.PacketConn.WriteTo(b, dst)
+	if err != nil && !isDeadline(err) {
+		p.mu.Lock()
+		closed := p.closed
+		p.mu.Unlock()
+		if !closed {
+			p.report(false)
+		}
+	}
 	if err == nil {
 		p.mu.Lock()
-		if !p.armed && !p.silent && !p.closed {
+		if p.noReply > 0 && !p.armed && !p.silent && !p.closed {
 			p.armed = true
 			p.gen++
 			gen := p.gen
@@ -188,6 +229,14 @@ func (p *obsPacket) WriteTo(b []byte, dst outbound.Addr) (int, error) {
 
 func (p *obsPacket) ReadFrom(b []byte) (int, outbound.Addr, error) {
 	n, src, err := p.PacketConn.ReadFrom(b)
+	if err != nil && !isDeadline(err) {
+		p.mu.Lock()
+		closed := p.closed
+		p.mu.Unlock()
+		if !closed {
+			p.report(false)
+		}
+	}
 	if err == nil {
 		p.mu.Lock()
 		notify := !p.closed && (!p.replied || p.silent)

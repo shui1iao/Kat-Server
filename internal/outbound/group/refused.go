@@ -1,6 +1,10 @@
 package group
 
 import (
+	"crypto/tls"
+	"errors"
+	"github.com/shui1iao/Kat/internal/outbound/socks5"
+	"github.com/shui1iao/Kat/internal/outbound/ss"
 	"net"
 
 	"github.com/shui1iao/Kat/internal/outbound"
@@ -30,7 +34,7 @@ import (
 // matching.
 func serverRefused(m outbound.Outbound, err error) bool {
 	switch m.Type() {
-	case "direct", TypeSelect, TypeURLTest, TypeFallback, TypeSmart:
+	case "direct", TypeSelect, TypeURLTest, TypeFallback, TypeSmart, TypeLoadBalance, TypeRelay:
 		return false
 	}
 	return localDialRefused(err)
@@ -56,4 +60,13 @@ func localDialRefused(err error) bool {
 		}
 	}
 	return false
+}
+
+func confirmedProxyFailure(m outbound.Outbound, err error) bool {
+	if serverRefused(m, err) || socks5.IsProxyFailure(err) || ss.IsProxyFailure(err) {
+		return true
+	}
+	var cert *tls.CertificateVerificationError
+	var record tls.RecordHeaderError
+	return errors.As(err, &cert) || errors.As(err, &record)
 }

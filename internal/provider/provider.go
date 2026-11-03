@@ -2,7 +2,7 @@
 // outbound options. Supported inputs:
 //
 //   - Clash / mihomo YAML: the top-level "proxies" list (a whole mihomo
-//     configuration works too; everything except "proxies" is ignored);
+//     configuration works too; only referenced url-test dependencies are kept);
 //   - URI lists: ss:// (SIP002, including the SIP022 plain "method:password"
 //     userinfo, and the legacy whole-base64 form), trojan://, anytls://,
 //     socks5:// (also socks:// and socks5h://), one per line, optionally
@@ -10,7 +10,7 @@
 //     padding); blank lines and lines starting with # or // are ignored;
 //   - sing-box JSON: the "outbounds" array (or a bare array of outbounds).
 //
-// Only node types Kat can dial are produced: shadowsocks (no SIP003 plugin),
+// Only node types Kat can dial are produced: shadowsocks (the scoped aes-128-gcm obfs/http transport),
 // trojan and anytls over plain TLS/TCP, and SOCKS5 without TLS. Everything
 // else is reported in Result.Skipped with the reason; credentials and raw
 // lines are never part of a report.
@@ -31,6 +31,7 @@ import (
 
 	"github.com/shui1iao/Kat/internal/outbound"
 	"github.com/shui1iao/Kat/internal/outbound/anytls"
+	"github.com/shui1iao/Kat/internal/outbound/group"
 	"github.com/shui1iao/Kat/internal/outbound/socks5"
 	"github.com/shui1iao/Kat/internal/outbound/ss"
 	"github.com/shui1iao/Kat/internal/outbound/trojan"
@@ -86,10 +87,11 @@ type Skipped struct {
 
 // Result is the parsed content of one subscription.
 type Result struct {
-	Format  string // clash | uri | uri-base64 | sing-box
-	Nodes   []Node
-	Skipped []Skipped
-	Renamed [][2]string // duplicate names: {original, new}
+	DependencyGroups []group.Options
+	Format           string // clash | uri | uri-base64 | sing-box
+	Nodes            []Node
+	Skipped          []Skipped
+	Renamed          [][2]string // duplicate names: {original, new}
 }
 
 // ErrFormat: the content is not in any supported format (or has no entry).
@@ -126,7 +128,9 @@ func Parse(b []byte, format string) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	r.dedupe()
+	if len(r.DependencyGroups) == 0 && !r.hasVia() {
+		r.dedupe()
+	}
 	return r, nil
 }
 
@@ -143,7 +147,7 @@ func (r *Result) add(n Node, typ string) {
 		return
 	}
 	if e := Validate(n.OutboundOptions()); e != nil {
-		r.skip(name, typ, "invalid for Kat: "+e.Error())
+		r.skip(name, typ, "invalid for Kat")
 		return
 	}
 	r.Nodes = append(r.Nodes, n)

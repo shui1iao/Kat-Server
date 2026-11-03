@@ -286,7 +286,7 @@ func TestURLTestRefusalNotImmediate(t *testing.T) {
 				t.Fatal(err)
 			}
 			waitRounds(t, g, 2)
-			if len(switches(ev)) != 0 { // probes still succeed: no switch
+			if len(switches(ev)) != 1 { // confirmed real failure avoids immediately; recovery is gated
 				t.Fatalf("switches %v", switches(ev))
 			}
 		})
@@ -369,7 +369,8 @@ func TestLocalDialRefused(t *testing.T) {
 			t.Errorf("%s: localDialRefused(%v) = %v, want %v", tc.name, tc.err, got, tc.want)
 		}
 	}
-	if !errors.Is(real, syscall.ECONNREFUSED) {
-		t.Fatalf("real refusal %v is not ECONNREFUSED", real)
+	var op *net.OpError
+	if !errors.As(real, &op) || op.Op != "dial" || !isConnRefused(op.Err) {
+		t.Fatalf("real loopback refusal has no native dial/refusal cause: %T %v", real, real)
 	}
 }

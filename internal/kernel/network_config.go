@@ -17,8 +17,9 @@ import (
 var errNetworkConfig = errors.New("invalid DNS or routing configuration")
 
 type DNSOptions struct {
-	Server       string `json:"server,omitempty"`
-	CacheEntries *int   `json:"cache_entries,omitempty"`
+	Server       string   `json:"server,omitempty"`
+	Servers      []string `json:"servers,omitempty"`
+	CacheEntries *int     `json:"cache_entries,omitempty"`
 }
 type RoutingOptions struct {
 	Rules []RouteRule `json:"rules,omitempty"`
@@ -125,6 +126,14 @@ func (o *DNSOptions) UnmarshalJSON(b []byte) error {
 	_ = json.Unmarshal(b, &m)
 	if _, ok := m["server"]; ok && p.Server == "" {
 		return errNetworkConfig
+	}
+	if _, ok := m["servers"]; ok {
+		if _, both := m["server"]; both || len(p.Servers) == 0 {
+			return errNetworkConfig
+		}
+	}
+	if _, e := dnsEndpoints((*DNSOptions)(&p)); e != nil {
+		return e
 	}
 	*o = DNSOptions(p)
 	return nil
@@ -291,17 +300,60 @@ func parseDNS(s string) (dnsEndpoint, error) {
 	}
 	return ep, nil
 }
-func (c *Config) validateNetwork() error {
-	if c.DNS != nil {
-		ep, e := parseDNS(c.DNS.Server)
-		if e != nil {
-			return e
+
+const maxDNSServers = 16
+
+// A nil list means explicit system-only DNS; an omitted block uses the defaults.
+func dnsEndpoints(o *DNSOptions) ([]dnsEndpoint, error) {
+	servers := []string{"udp://8.8.8.8:53", "udp://1.1.1.1:53"}
+	if o != nil {
+		if o.Server != "" && o.Servers != nil || o.Servers != nil && (len(o.Servers) == 0 || len(o.Servers) > maxDNSServers) {
+			return nil, errNetworkConfig
 		}
-		if c.DNS.CacheEntries != nil {
-			n := *c.DNS.CacheEntries
-			if n < 0 || n > 4096 || ep.scheme == "system" && n != 0 {
-				return errNetworkConfig
-			}
+		if o.Server == "system" {
+			return nil, nil
+		}
+		if o.Server != "" {
+			servers = []string{o.Server}
+		} else if o.Servers != nil {
+			servers = o.Servers
+		}
+	}
+	eps := make([]dnsEndpoint, 0, len(servers))
+	for _, server := range servers {
+		ep, e := parseDNS(server)
+		if e != nil || ep.scheme == "system" {
+			return nil, errNetworkConfig
+		}
+		eps = append(eps, ep)
+	}
+	return eps, nil
+}
+
+func cloneDNSOptions(o *DNSOptions) *DNSOptions {
+	if o == nil {
+		return nil
+	}
+	v := *o
+	if o.Servers != nil {
+		v.Servers = append([]string{}, o.Servers...)
+	}
+	if o.CacheEntries != nil {
+		n := *o.CacheEntries
+		v.CacheEntries = &n
+	}
+	return &v
+}
+
+func (c *Config) validateNetwork() error {
+	eps, e := dnsEndpoints(c.DNS)
+	if e != nil {
+		return e
+	}
+	if c.DNS != nil && c.DNS.CacheEntries != nil {
+		n := *c.DNS.CacheEntries
+		if n < 0 || n > 4096 || len(eps) == 0 && n != 0 {
+			return errNetworkConfig
 		}
 	}
 	if c.Routing == nil {

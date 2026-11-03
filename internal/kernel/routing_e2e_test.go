@@ -747,11 +747,11 @@ func (w *e2eWorld) expect(what string, got map[string][2]int64, want map[string]
 	w.logf("EVIDENCE %s: forwarder deltas (tcp_conns,udp_datagrams)=%v", what, got)
 }
 
-// ---- 1. default configuration: inbounds only ----
+// ---- 1. explicit system DNS: isolate localhost from public defaults ----
 
 func TestE2EDefaultDirect(t *testing.T) {
 	w := e2eSetup(t)
-	p, c := w.entry(nil)
+	p, c := w.entry(map[string]any{"dns": map[string]any{"server": "system"}})
 	for _, cl := range []struct {
 		n string
 		d outbound.Dialer
@@ -761,7 +761,7 @@ func TestE2EDefaultDirect(t *testing.T) {
 		w.must(cl.n+" UDP direct echo", e2eUDP(cl.d, "127.0.0.1", w.echoUDP, 3))
 	}
 	if n := w.dns.count.Load(); n != 0 {
-		t.Fatalf("default configuration queried the test DNS server %d times", n)
+		t.Fatalf("explicit system configuration queried the test DNS server %d times", n)
 	}
 	w.stopEntry(p)
 }

@@ -87,6 +87,9 @@ type session struct {
 	lastUsed  time.Time
 	idleGen   uint64
 	idleTimer *time.Timer
+
+	// Immutable guards for the actual carrier path (nil for a static path).
+	route []func() bool
 }
 
 func newSession(o *Outbound, conn net.Conn, scheme *paddingScheme, settings []byte) *session {
@@ -193,7 +196,9 @@ func (s *session) cancel(r *writeReq) bool {
 	}
 	for i, q := range s.queue {
 		if q == r {
-			s.queue = append(s.queue[:i], s.queue[i+1:]...)
+			copy(s.queue[i:], s.queue[i+1:])
+			s.queue[len(s.queue)-1] = nil
+			s.queue = s.queue[:len(s.queue)-1]
 			return true
 		}
 	}
@@ -236,7 +241,9 @@ func (s *session) writeLoop() {
 			n++
 		}
 		batch := append([]*writeReq(nil), s.queue[:n]...)
-		s.queue = append(s.queue[:0], s.queue[n:]...)
+		remaining := copy(s.queue, s.queue[n:])
+		clear(s.queue[remaining:])
+		s.queue = s.queue[:remaining]
 		s.mu.Unlock()
 		buf = buf[:0]
 		for _, r := range batch {

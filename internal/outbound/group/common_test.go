@@ -23,6 +23,19 @@ import (
 
 var autoTypes = []string{TypeURLTest, TypeFallback, TypeSmart}
 
+// These retry/filter/transparency fixtures exercise traffic AFTER readiness,
+// not cold admission. Supply one complete valid probe round for Smart only.
+func bootstrapSmartTrafficFixture(g *autoGroup) {
+	if g.cfg.kind != TypeSmart {
+		return
+	}
+	samples := make([]ProbeSample, len(g.members))
+	for i, name := range g.cfg.members {
+		samples[i] = ProbeSample{Name: name, Latency: time.Duration(i+1) * 100 * time.Millisecond, At: g.clk.Now()}
+	}
+	g.RecordProbeRound(samples)
+}
+
 func listenLoop(t *testing.T) net.Listener {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -54,6 +67,7 @@ func TestRetryNextMemberOnDialError(t *testing.T) {
 		a, b := newFake("a"), newFake("b")
 		a.setErr(errors.New("handshake failed"))
 		g := newAuto(t, Options{Type: typ}, members(a, b), newFakeClock(), newFakeProbe(map[string]time.Duration{}), nil)
+		bootstrapSmartTrafficFixture(g)
 		if got := dial(t, g, "x.test"); got != "b" {
 			t.Fatalf("%s: dial via %q, want b", typ, got)
 		}
@@ -73,6 +87,7 @@ func TestRetryAtMostThreeMembers(t *testing.T) {
 			fs, fakes = append(fs, f), append(fakes, f)
 		}
 		g := newAuto(t, Options{Type: typ}, fs, newFakeClock(), newFakeProbe(map[string]time.Duration{}), nil)
+		bootstrapSmartTrafficFixture(g)
 		_, err := g.DialTCP(context.Background(), outbound.Addr{Host: "x.test", Port: 80})
 		if err == nil {
 			t.Fatalf("%s: dial succeeded", typ)
@@ -111,6 +126,7 @@ func TestNoRetryAfterDataWritten(t *testing.T) {
 	for _, typ := range autoTypes {
 		a, b := newFake("a"), newFake("b")
 		g := newAuto(t, Options{Type: typ}, members(a, b), newFakeClock(), newFakeProbe(map[string]time.Duration{}), nil)
+		bootstrapSmartTrafficFixture(g)
 		c, err := g.DialTCP(context.Background(), outbound.Addr{Host: "x.test", Port: 80})
 		if err != nil {
 			t.Fatal(err)
@@ -199,6 +215,7 @@ func TestUDPMemberFilter(t *testing.T) {
 		a, b, c := newFake("a"), newFake("b"), newFake("c")
 		a.udp = false
 		g := newAuto(t, Options{Type: typ}, members(a, b, c), newFakeClock(), newFakeProbe(map[string]time.Duration{}), nil)
+		bootstrapSmartTrafficFixture(g)
 		if g.Current() != "a" || !g.UDP() {
 			t.Fatalf("%s: current %q udp %v", typ, g.Current(), g.UDP())
 		}
@@ -220,6 +237,7 @@ func TestUDPMemberFilter(t *testing.T) {
 		n1, n2 := newFake("n1"), newFake("n2")
 		n1.udp, n2.udp = false, false
 		g2 := newAuto(t, Options{Type: typ}, members(n1, n2), newFakeClock(), newFakeProbe(map[string]time.Duration{}), nil)
+		bootstrapSmartTrafficFixture(g2)
 		if g2.UDP() {
 			t.Fatalf("%s: UDP() true without UDP members", typ)
 		}
@@ -466,6 +484,7 @@ func TestConnWrapperTransparent(t *testing.T) {
 	direct := &loopOut{name: "direct"}
 	pipeOnly := newFake("p")
 	g := newAuto(t, Options{Type: TypeSmart, Members: []string{"direct", "p"}}, members(direct, pipeOnly), newFakeClock(), newFakeProbe(map[string]time.Duration{}), nil)
+	bootstrapSmartTrafficFixture(g)
 	c, err := g.DialTCP(context.Background(), addrOf(ln))
 	if err != nil {
 		t.Fatal(err)
@@ -490,6 +509,7 @@ func TestConnWrapperTransparent(t *testing.T) {
 	}
 	// a conn without CloseWrite must not grow one
 	g2 := newAuto(t, Options{Type: TypeSmart, Members: []string{"p"}}, members(pipeOnly), newFakeClock(), newFakeProbe(map[string]time.Duration{}), nil)
+	bootstrapSmartTrafficFixture(g2)
 	c2, err := g2.DialTCP(context.Background(), outbound.Addr{Host: "x.test", Port: 1})
 	if err != nil {
 		t.Fatal(err)
@@ -539,28 +559,28 @@ func TestValidate(t *testing.T) {
 		many[i] = "m" + string(rune('a'+i%26)) + string(rune('a'+i/26))
 	}
 	bad := map[string]Options{
-		"no name":             {Type: TypeSelect, Members: []string{"a"}},
-		"bad type":            {Name: "g", Type: "load-balance", Members: []string{"a"}},
-		"no members":          {Name: "g", Type: TypeSelect},
-		"65 members":          {Name: "g", Type: TypeSelect, Members: many},
-		"dup member":          {Name: "g", Type: TypeSelect, Members: []string{"a", "a"}},
-		"self member":         {Name: "g", Type: TypeSelect, Members: []string{"g"}},
-		"selected not member": {Name: "g", Type: TypeSelect, Members: []string{"a"}, Selected: "b"},
-		"select with probe":   {Name: "g", Type: TypeSelect, Members: []string{"a"}, Probe: p},
-		"selected on auto":    {Name: "g", Type: TypeURLTest, Members: []string{"a"}, Probe: p, Selected: "a"},
-		"auto without probe":  {Name: "g", Type: TypeSmart, Members: []string{"a"}},
-		"probe no url":        {Name: "g", Type: TypeURLTest, Members: []string{"a"}, Probe: &ProbeOptions{}},
-		"probe ftp":           {Name: "g", Type: TypeURLTest, Members: []string{"a"}, Probe: &ProbeOptions{URL: "ftp://x/"}},
-		"probe relative":      {Name: "g", Type: TypeURLTest, Members: []string{"a"}, Probe: &ProbeOptions{URL: "/generate_204"}},
-		"probe port 0":        {Name: "g", Type: TypeURLTest, Members: []string{"a"}, Probe: &ProbeOptions{URL: "http://x:0/"}},
-		"timeout > 60s":       {Name: "g", Type: TypeURLTest, Members: []string{"a"}, Probe: &ProbeOptions{URL: "http://x/", Timeout: outbound.Duration(61 * time.Second)}},
-		"negative interval":   {Name: "g", Type: TypeURLTest, Members: []string{"a"}, Probe: &ProbeOptions{URL: "http://x/", Interval: outbound.Duration(-time.Second)}},
-		"tolerance on smart":  {Name: "g", Type: TypeSmart, Members: []string{"a"}, Probe: p, Tolerance: outbound.Duration(time.Second)},
-		"priority on fb":      {Name: "g", Type: TypeFallback, Members: []string{"a"}, Probe: p, Priority: map[string]float64{"a": 1}},
-		"priority unknown":    {Name: "g", Type: TypeSmart, Members: []string{"a"}, Probe: p, Priority: map[string]float64{"b": 1}},
-		"priority zero":       {Name: "g", Type: TypeSmart, Members: []string{"a"}, Probe: p, Priority: map[string]float64{"a": 0}},
-		"priority > 100":      {Name: "g", Type: TypeSmart, Members: []string{"a"}, Probe: p, Priority: map[string]float64{"a": 101}},
-		"reject in auto":      {Name: "g", Type: TypeFallback, Members: []string{"a", "reject"}, Probe: p},
+		"no name":               {Type: TypeSelect, Members: []string{"a"}},
+		"bad type":              {Name: "g", Type: "load-balance", Members: []string{"a"}},
+		"no members":            {Name: "g", Type: TypeSelect},
+		"65 members":            {Name: "g", Type: TypeSelect, Members: many},
+		"dup member":            {Name: "g", Type: TypeSelect, Members: []string{"a", "a"}},
+		"self member":           {Name: "g", Type: TypeSelect, Members: []string{"g"}},
+		"selected not member":   {Name: "g", Type: TypeSelect, Members: []string{"a"}, Selected: "b"},
+		"select with probe":     {Name: "g", Type: TypeSelect, Members: []string{"a"}, Probe: p},
+		"selected on auto":      {Name: "g", Type: TypeURLTest, Members: []string{"a"}, Probe: p, Selected: "a"},
+		"auto without probe":    {Name: "g", Type: TypeSmart, Members: []string{"a"}},
+		"probe no url":          {Name: "g", Type: TypeURLTest, Members: []string{"a"}, Probe: &ProbeOptions{}},
+		"probe ftp":             {Name: "g", Type: TypeURLTest, Members: []string{"a"}, Probe: &ProbeOptions{URL: "ftp://x/"}},
+		"probe relative":        {Name: "g", Type: TypeURLTest, Members: []string{"a"}, Probe: &ProbeOptions{URL: "/generate_204"}},
+		"probe port 0":          {Name: "g", Type: TypeURLTest, Members: []string{"a"}, Probe: &ProbeOptions{URL: "http://x:0/"}},
+		"timeout > 60s":         {Name: "g", Type: TypeURLTest, Members: []string{"a"}, Probe: &ProbeOptions{URL: "http://x/", Timeout: outbound.Duration(61 * time.Second)}},
+		"negative interval":     {Name: "g", Type: TypeURLTest, Members: []string{"a"}, Probe: &ProbeOptions{URL: "http://x/", Interval: outbound.Duration(-time.Second)}},
+		"tolerance on fallback": {Name: "g", Type: TypeFallback, Members: []string{"a"}, Probe: p, Tolerance: outbound.Duration(time.Second)},
+		"priority on fb":        {Name: "g", Type: TypeFallback, Members: []string{"a"}, Probe: p, Priority: map[string]float64{"a": 1}},
+		"priority unknown":      {Name: "g", Type: TypeSmart, Members: []string{"a"}, Probe: p, Priority: map[string]float64{"b": 1}},
+		"priority zero":         {Name: "g", Type: TypeSmart, Members: []string{"a"}, Probe: p, Priority: map[string]float64{"a": 0}},
+		"priority > 100":        {Name: "g", Type: TypeSmart, Members: []string{"a"}, Probe: p, Priority: map[string]float64{"a": 101}},
+		"reject in auto":        {Name: "g", Type: TypeFallback, Members: []string{"a", "reject"}, Probe: p},
 	}
 	for name, o := range bad {
 		if err := Validate(o); err == nil {
@@ -584,12 +604,12 @@ func TestValidate(t *testing.T) {
 }
 
 func TestDefaultsApplied(t *testing.T) {
-	for typ, want := range map[string]time.Duration{TypeURLTest: 10 * time.Minute, TypeFallback: 10 * time.Minute, TypeSmart: 5 * time.Minute} {
+	for typ, want := range map[string]time.Duration{TypeURLTest: time.Minute, TypeFallback: 10 * time.Minute, TypeSmart: 5 * time.Minute} {
 		c, err := normalize(Options{Name: "g", Type: typ, Members: []string{"a"}, Probe: probeOpts()})
 		if err != nil || c.interval != want || c.timeout != 5*time.Second {
 			t.Fatalf("%s: %+v %v", typ, c, err)
 		}
-		if typ == TypeURLTest && c.tolerance != 100*time.Millisecond {
+		if typ == TypeURLTest && c.tolerance != 20*time.Millisecond {
 			t.Fatalf("tolerance default %v", c.tolerance)
 		}
 		if typ == TypeSmart && c.priority[0] != 1 {

@@ -19,25 +19,27 @@ import (
 	"sync"
 	"time"
 
+	"github.com/shui1iao/Kat/internal/outbound"
 	"github.com/shui1iao/Kat/internal/outbound/group"
 	"github.com/shui1iao/Kat/internal/provider"
 )
 
 // ProviderConfig is one root "providers" entry (subscription node set).
 type ProviderConfig struct {
-	Name          string            `json:"name"`
-	Type          string            `json:"type"`                     // http | file
-	URL           string            `json:"url,omitempty"`            // http: subscription URL
-	Path          string            `json:"path,omitempty"`           // file: source; http: cache (default in the state directory)
-	Interval      Duration          `json:"interval,omitempty"`       // http: refresh (default 1h); file: re-read (default only on reload)
-	Timeout       Duration          `json:"timeout,omitempty"`        // http: whole request, default 30s
-	Via           string            `json:"via,omitempty"`            // http: outbound or group used to fetch, default direct
-	UserAgent     string            `json:"user_agent,omitempty"`     // http: default "clash.meta"
-	Headers       map[string]string `json:"headers,omitempty"`        // http: extra request headers
-	Format        string            `json:"format,omitempty"`         // auto (default) | clash | uri | sing-box
-	Filter        string            `json:"filter,omitempty"`         // keep nodes whose name matches (RE2, ` separates alternatives)
-	ExcludeFilter string            `json:"exclude_filter,omitempty"` // drop nodes whose name matches
-	ExcludeType   string            `json:"exclude_type,omitempty"`   // drop node types, e.g. "socks5|shadowsocks"
+	DependencyProbeURL string            `json:"dependency_probe_url,omitempty"`
+	Name               string            `json:"name"`
+	Type               string            `json:"type"`                     // http | file
+	URL                string            `json:"url,omitempty"`            // http: subscription URL
+	Path               string            `json:"path,omitempty"`           // file: source; http: cache (default in the state directory)
+	Interval           Duration          `json:"interval,omitempty"`       // http: refresh (default 1h); file: re-read (default only on reload)
+	Timeout            Duration          `json:"timeout,omitempty"`        // http: whole request, default 30s
+	Via                string            `json:"via,omitempty"`            // http: outbound or group used to fetch, default direct
+	UserAgent          string            `json:"user_agent,omitempty"`     // http: default "clash.meta"
+	Headers            map[string]string `json:"headers,omitempty"`        // http: extra request headers
+	Format             string            `json:"format,omitempty"`         // auto (default) | clash | uri | sing-box
+	Filter             string            `json:"filter,omitempty"`         // keep nodes whose name matches (RE2, ` separates alternatives)
+	ExcludeFilter      string            `json:"exclude_filter,omitempty"` // drop nodes whose name matches
+	ExcludeType        string            `json:"exclude_type,omitempty"`   // drop node types, e.g. "socks5|shadowsocks"
 }
 
 func (o *ProviderConfig) UnmarshalJSON(b []byte) error {
@@ -120,6 +122,11 @@ func (c *Config) validateProviders() error {
 		default:
 			return fail("format must be auto, clash, uri or sing-box")
 		}
+		if p.DependencyProbeURL != "" {
+			if group.Validate(group.Options{Name: "dependency", Type: group.TypeURLTest, Members: []string{"member"}, Probe: &group.ProbeOptions{URL: p.DependencyProbeURL}}) != nil {
+				return errors.New("invalid dependency_probe_url")
+			}
+		}
 		if _, e := providerFilter(*p); e != nil {
 			return fail("%v", e)
 		}
@@ -190,23 +197,24 @@ type providerRT struct {
 	key   string
 	cache string
 
-	mu       sync.Mutex
-	hash     [32]byte
-	res      provider.Result
-	loaded   bool
-	source   string // file | cache | fetch | none
-	updated  time.Time
-	attempt  time.Time
-	lastErr  string
-	failures int64
-	updates  int64
+	updateSlot chan struct{}
+	mu         sync.Mutex
+	hash       [32]byte
+	res        provider.Result
+	loaded     bool
+	source     string // file | cache | fetch | none
+	updated    time.Time
+	attempt    time.Time
+	lastErr    string
+	failures   int64
+	updates    int64
 
 	cancel context.CancelFunc
 	done   chan struct{}
 }
 
 func newProviderRT(k *core, p ProviderConfig, statsFile string) *providerRT {
-	return &providerRT{k: k, cfg: p, key: p.sourceKey(statsFile), cache: p.cachePath(statsFile), source: "none"}
+	return &providerRT{k: k, cfg: p, key: p.sourceKey(statsFile), cache: p.cachePath(statsFile), source: "none", updateSlot: make(chan struct{}, 1)}
 }
 
 // loadLocal reads the file (file providers) or the cache (http providers).
@@ -232,6 +240,11 @@ func (p *providerRT) loadLocal() (provider.Result, error) {
 	if e != nil {
 		return res, e
 	}
+	if len(res.DependencyGroups) > 0 {
+		if _, _, _, e := res.Materialize("", p.cfg.DependencyProbeURL, nil, nil); e != nil {
+			return res, provider.ErrDependency
+		}
+	}
 	st, _ := os.Stat(path)
 	p.mu.Lock()
 	p.res, p.hash, p.loaded = res, sha256.Sum256(b), true
@@ -247,11 +260,27 @@ func (p *providerRT) loadLocal() (provider.Result, error) {
 }
 
 func readLimited(path string) ([]byte, error) {
-	f, e := os.Open(path)
+	// File providers and cache entries are finite regular files, not FIFOs
+	// or devices whose open/read can outlive every refresh/Stop deadline.
+	st, e := os.Stat(path)
+	if e != nil {
+		return nil, e
+	}
+	if !st.Mode().IsRegular() {
+		return nil, errors.New("provider source is not a regular file")
+	}
+	f, e := openProviderFile(path)
 	if e != nil {
 		return nil, e
 	}
 	defer f.Close()
+	actual, e := f.Stat()
+	if e != nil {
+		return nil, e
+	}
+	if !actual.Mode().IsRegular() {
+		return nil, errors.New("provider source is not a regular file")
+	}
 	b, e := io.ReadAll(io.LimitReader(f, provider.MaxSize+1))
 	if e != nil {
 		return nil, e
@@ -271,7 +300,8 @@ func (p *providerRT) snapshot() (provider.Result, bool) {
 func (p *providerRT) start(ctx context.Context) {
 	ctx, p.cancel = context.WithCancel(ctx)
 	p.done = make(chan struct{})
-	go p.run(ctx)
+	p.k.providerWG.Add(1)
+	go func() { defer p.k.providerWG.Done(); p.run(ctx) }()
 }
 
 func (p *providerRT) stop() {
@@ -321,8 +351,22 @@ func (p *providerRT) run(ctx context.Context) {
 }
 
 // update fetches (http) or re-reads (file) once. A failure keeps the
-// previous nodes; a changed node set asks the core for a new generation.
-func (p *providerRT) update(ctx context.Context) {
+// previous snapshot/cache/runtime; changed graphs synchronously commit once.
+func (p *providerRT) update(ctx context.Context) error {
+	// A manual refresh queued behind a background update must still honor
+	// its request deadline/Stop/EOF instead of waiting for an unrelated fetch.
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	select {
+	case p.updateSlot <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-p.updateSlot }()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	var b []byte
 	var e error
 	if p.cfg.Type == "http" {
@@ -331,7 +375,7 @@ func (p *providerRT) update(ctx context.Context) {
 		b, e = readLimited(p.cfg.Path)
 	}
 	if ctx.Err() != nil {
-		return
+		return ctx.Err()
 	}
 	var res provider.Result
 	if e == nil {
@@ -340,55 +384,64 @@ func (p *providerRT) update(ctx context.Context) {
 			e = errors.New("no usable node")
 		}
 	}
+	if e == nil {
+		h := sha256.Sum256(b)
+		g := p.k.gen.Load()
+		if g == nil {
+			e = errors.New("provider_stale")
+		} else {
+			_, e = g.reloadProvider(ctx, &providerCandidate{p: p, res: res, body: b, hash: h})
+		}
+	}
+	if e != nil {
+		p.mu.Lock()
+		p.attempt = time.Now()
+		p.failures++
+		p.lastErr = "provider_refresh_failed"
+		p.mu.Unlock()
+		p.k.notice(levelWarn, "kat event=provider_update_failed provider="+p.cfg.Name+" reason=refresh_failed action=keep_previous")
+		return errors.New("provider refresh failed; previous nodes retained")
+	}
+	return nil
+}
+
+type providerCandidate struct {
+	ctx  context.Context
+	p    *providerRT
+	res  provider.Result
+	body []byte
+	hash [32]byte
+}
+
+// Called only after generation commit, under reloadMu, before another rebuild.
+func (q *providerCandidate) accept() {
+	p := q.p
 	now := time.Now()
 	p.mu.Lock()
-	p.attempt = now
-	if e != nil {
-		p.failures++
-		p.lastErr = e.Error()
-		kept := len(p.res.Nodes)
-		p.mu.Unlock()
-		p.k.notice(levelWarn, "kat event=provider_update_failed provider="+p.cfg.Name+" action=keep_previous nodes="+strconv.Itoa(kept)+" reason="+eventToken(e.Error(), 200))
-		for _, line := range skippedLines(p.cfg.Name, res) {
-			p.k.notice(levelWarn, line)
-		}
-		return
-	}
-	h := sha256.Sum256(b)
-	changed := !p.loaded || h != p.hash
-	p.lastErr = ""
-	p.updated = now
+	p.res, p.hash, p.loaded = q.res, q.hash, true
+	p.updated, p.attempt = now, now
 	p.updates++
+	p.lastErr = ""
+	p.source = "file"
 	if p.cfg.Type == "http" {
 		p.source = "fetch"
-	} else {
-		p.source = "file"
-	}
-	if changed {
-		p.res, p.hash, p.loaded = res, h, true
 	}
 	p.mu.Unlock()
 	if p.cache != "" {
-		if changed {
-			if e := writeFileAtomic(p.cache, b); e != nil {
-				p.k.notice(levelWarn, "kat event=provider_cache_failed provider="+p.cfg.Name+" reason=io")
-			}
-		} else {
-			_ = os.Chtimes(p.cache, now, now)
+		if e := writeFileAtomic(p.cache, q.body); e != nil {
+			p.k.notice(levelWarn, "kat event=provider_cache_failed provider="+p.cfg.Name+" reason=io")
 		}
 	}
-	if !changed {
-		p.k.notice(levelDebug, "kat event=provider_unchanged provider="+p.cfg.Name)
-		return
-	}
-	p.k.notice(levelInfo, "kat event=provider_updated provider="+p.cfg.Name+" format="+res.Format+" nodes="+strconv.Itoa(len(res.Nodes))+" skipped="+strconv.Itoa(len(res.Skipped)))
-	for _, line := range skippedLines(p.cfg.Name, res) {
-		p.k.notice(levelWarn, line)
-	}
-	p.k.requestRebuild()
+	p.k.notice(levelInfo, "kat event=provider_updated provider="+p.cfg.Name+" nodes="+strconv.Itoa(len(q.res.Nodes)))
 }
 
 func (p *providerRT) fetch(ctx context.Context) ([]byte, error) {
+	return p.fetchRequest(ctx, (*http.Client).Do)
+}
+
+// fetchRequest keeps the real HTTP path while allowing a test to observe the
+// request's context deadline without waiting for a multi-minute timeout.
+func (p *providerRT) fetchRequest(ctx context.Context, do func(*http.Client, *http.Request) (*http.Response, error)) ([]byte, error) {
 	g := p.k.gen.Load()
 	if g == nil || !g.tryRef() {
 		return nil, errors.New("server not running")
@@ -398,10 +451,7 @@ func (p *providerRT) fetch(ctx context.Context) ([]byte, error) {
 	if e != nil {
 		return nil, fmt.Errorf("via %q is not available", p.cfg.Via)
 	}
-	timeout := defaultProviderTimeout
-	if p.cfg.Timeout != 0 {
-		timeout = p.cfg.Timeout.value()
-	}
+	timeout := p.refreshTimeout()
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	tr := &http.Transport{Proxy: nil, DialContext: dial, DisableKeepAlives: true, MaxResponseHeaderBytes: 64 << 10, ForceAttemptHTTP2: true}
@@ -419,13 +469,13 @@ func (p *providerRT) fetch(ctx context.Context) ([]byte, error) {
 	for k, v := range p.cfg.Headers {
 		req.Header.Set(k, v)
 	}
-	resp, e := client.Do(req)
+	resp, e := do(client, req)
 	if e != nil {
 		var ue *url.Error // the URL may carry a token: report the cause only
 		if errors.As(e, &ue) {
 			e = ue.Err
 		}
-		return nil, fmt.Errorf("request failed: %v", e)
+		return nil, errors.New("provider_request_failed")
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
@@ -433,7 +483,7 @@ func (p *providerRT) fetch(ctx context.Context) ([]byte, error) {
 	}
 	b, e := io.ReadAll(io.LimitReader(resp.Body, provider.MaxSize+1))
 	if e != nil {
-		return nil, fmt.Errorf("read failed: %v", e)
+		return nil, errors.New("provider_read_failed")
 	}
 	if len(b) > provider.MaxSize {
 		return nil, fmt.Errorf("larger than %d bytes", provider.MaxSize)
@@ -442,14 +492,11 @@ func (p *providerRT) fetch(ctx context.Context) ([]byte, error) {
 }
 
 func skippedLines(name string, res provider.Result) []string {
-	var out []string
-	for _, s := range res.Skipped {
-		out = append(out, "kat event=provider_node_skipped provider="+name+" node="+eventToken(s.Name, 128)+" type="+eventToken(s.Type, 32)+" reason="+eventToken(s.Reason, 200))
+	if len(res.Skipped) == 0 && len(res.Renamed) == 0 {
+		return nil
 	}
-	for _, r := range res.Renamed {
-		out = append(out, "kat event=provider_node_renamed provider="+name+" from="+eventToken(r[0], 128)+" to="+eventToken(r[1], 128))
-	}
-	return out
+	return []string{"kat event=provider_entries_report provider=" + name + " skipped=" + strconv.Itoa(len(res.Skipped)) + " renamed=" + strconv.Itoa(len(res.Renamed))}
+
 }
 
 // requestRebuild asks for a new generation with the current provider nodes
@@ -483,6 +530,7 @@ type providerPlan struct {
 	next  map[string]*providerRT
 	fresh []*providerRT // created for this generation (loops not started)
 	notes []string
+	err   error
 }
 
 // syncProviders builds the provider set for c. reread: file providers are
@@ -511,11 +559,14 @@ func (k *core) syncProviders(c *Config, reread bool) *providerPlan {
 		if rejected, e := p.loadLocal(); e != nil {
 			p.mu.Lock()
 			p.failures++
-			p.lastErr = e.Error()
+			p.lastErr = "provider_load_failed"
 			kept := len(p.res.Nodes)
 			p.mu.Unlock()
+			if errors.Is(e, provider.ErrDependency) && !hadPrev {
+				pl.err = provider.ErrDependency
+			}
 			pl.notes = append(pl.notes, skippedLines(pc.Name, rejected)...)
-			pl.notes = append(pl.notes, "kat event=provider_load_failed provider="+pc.Name+" action=keep_previous nodes="+strconv.Itoa(kept)+" reason="+eventToken(e.Error(), 200))
+			pl.notes = append(pl.notes, "kat event=provider_load_failed provider="+pc.Name+" action=keep_previous nodes="+strconv.Itoa(kept)+" reason=load_failed")
 		} else if res, ok := p.snapshot(); ok && (!hadPrev || prevHash != p.hash) {
 			pl.notes = append(pl.notes, "kat event=provider_loaded provider="+pc.Name+" source="+p.source+" format="+res.Format+" nodes="+strconv.Itoa(len(res.Nodes))+" skipped="+strconv.Itoa(len(res.Skipped)))
 			pl.notes = append(pl.notes, skippedLines(pc.Name, res)...)
@@ -540,9 +591,7 @@ func (k *core) installProviders(pl *providerPlan) {
 	for name, p := range old {
 		if pl.next[name] != p {
 			p.stop()
-			if p.done != nil {
-				<-p.done
-			}
+
 		}
 	}
 	for _, p := range pl.fresh {
@@ -575,7 +624,10 @@ func (k *core) stopProviders() {
 // expandProviders adds the provider nodes to c.Outbounds and resolves the
 // dynamic members of every group (use, include_all*, filters). No network
 // I/O. c must be the configuration as loaded (unexpanded).
-func expandProviders(c *Config, provs map[string]*providerRT) []string {
+func expandProviders(c *Config, provs map[string]*providerRT) ([]string, error) {
+	return expandProviderCandidate(c, provs, nil)
+}
+func expandProviderCandidate(c *Config, provs map[string]*providerRT, q *providerCandidate) ([]string, error) {
 	var notes []string
 	written := len(c.Outbounds)
 	taken := map[string]bool{"direct": true, "reject": true}
@@ -589,6 +641,7 @@ func expandProviders(c *Config, provs map[string]*providerRT) []string {
 	}
 	outs := append([]OutboundConfig(nil), c.Outbounds...)
 	byProvider := map[string][]string{}
+	dependencyGroups := []GroupConfig{}
 	total := 0
 	for _, pc := range c.Providers {
 		p := provs[pc.Name]
@@ -596,7 +649,30 @@ func expandProviders(c *Config, provs map[string]*providerRT) []string {
 			continue
 		}
 		res, _ := p.snapshot()
+		if q != nil && p == q.p {
+			res = q.res
+		}
 		keep, _ := providerFilter(pc)
+		graph := len(res.DependencyGroups) > 0
+		for _, n := range res.Nodes {
+			graph = graph || n.Options.Via != ""
+		}
+		if graph {
+			os, gs, roots, e := res.Materialize(pc.Name, pc.DependencyProbeURL, taken, keep)
+			if e != nil || total+len(os) > maxProviderNodesTotal {
+				return nil, provider.ErrDependency
+			}
+			for _, o := range os {
+				outs = append(outs, OutboundConfig(o))
+				types[o.Name] = o.Type
+			}
+			for _, g := range gs {
+				dependencyGroups = append(dependencyGroups, GroupConfig(g))
+			}
+			byProvider[pc.Name] = roots
+			total += len(os)
+			continue
+		}
 		for _, n := range res.Nodes {
 			if keep != nil && !keep(n.Options.Name, n.Options.Type) {
 				continue
@@ -613,7 +689,7 @@ func expandProviders(c *Config, provs map[string]*providerRT) []string {
 				for i := 2; taken[name]; i++ {
 					name = provider.SuffixedName(orig, "@"+pc.Name+"#"+strconv.Itoa(i))
 				}
-				notes = append(notes, "kat event=provider_node_renamed provider="+pc.Name+" from="+eventToken(orig, 128)+" to="+eventToken(name, 128))
+				notes = append(notes, "kat event=provider_node_renamed provider="+pc.Name)
 			}
 			taken[name] = true
 			o.Name = name
@@ -624,6 +700,10 @@ func expandProviders(c *Config, provs map[string]*providerRT) []string {
 		}
 	}
 	c.Outbounds = outs
+	labels := map[string]string{}
+	for _, o := range outs {
+		labels[o.Name] = outbound.Options(o).FilterLabel()
+	}
 	c.providerNodes = len(outs) - written
 	groups := append([]GroupConfig(nil), c.Groups...)
 	for i := range groups {
@@ -648,7 +728,7 @@ func expandProviders(c *Config, provs map[string]*providerRT) []string {
 				if in[n] || n == g.Name || len(members) >= 1024 {
 					continue
 				}
-				if keep != nil && !keep(n, types[n]) {
+				if keep != nil && !keep(labels[n], types[n]) {
 					continue
 				}
 				in[n] = true
@@ -676,17 +756,35 @@ func expandProviders(c *Config, provs map[string]*providerRT) []string {
 			}
 		}
 		g.Members = members
-		if g.Selected != "" && !in[g.Selected] {
+	}
+	groups = append(groups, dependencyGroups...)
+	explicitCounts := map[string]int{}
+	for _, g := range append(append([]GroupConfig(nil), c.Groups...), dependencyGroups...) {
+		explicitCounts[g.Name] = len(g.Members)
+	}
+	if e := expandSourceGroups(groups, labels, types, explicitCounts); e != nil {
+		return nil, e
+	}
+	for i := range groups {
+		g := &groups[i]
+		if g.Type == group.TypeRelay || !group.Options(*g).Dynamic() {
+			continue
+		}
+		available := false
+		for _, m := range g.Members {
+			available = available || m == g.Selected
+		}
+		if g.Selected != "" && !available {
 			notes = append(notes, "kat event=group_selected_unavailable group="+eventToken(g.Name, 64)+" action=first_member")
 			g.Selected = ""
 		}
-		if len(members) == 0 {
+		if len(g.Members) == 0 {
 			notes = append(notes, "kat event=group_empty group="+eventToken(g.Name, 64)+" reason=no_provider_node")
 		}
 	}
 	c.Groups = groups
 	c.expanded = true
-	return notes
+	return notes, nil
 }
 
 // ProviderView is one entry of the planned "providers" section of GET /v1/stats.
@@ -777,11 +875,33 @@ func CheckProviders(c Config) ([]ProviderReport, []GroupReport, error) {
 		reps = append(reps, rep)
 	}
 	written := len(c.Outbounds)
-	expandProviders(&c, provs)
+	if _, e := expandProviders(&c, provs); e != nil {
+		return reps, nil, e
+	}
 	cursor := written
 	for i, pc := range c.Providers {
 		res, _ := provs[pc.Name].snapshot()
 		keep, _ := providerFilter(pc)
+		graph := len(res.DependencyGroups) > 0
+		for _, n := range res.Nodes {
+			graph = graph || n.Options.Via != ""
+		}
+		if graph {
+			outs, _, _, e := res.Materialize(pc.Name, pc.DependencyProbeURL, nil, keep)
+			if e != nil {
+				return reps, nil, e
+			}
+			reps[i].Nodes = nil
+			reps[i].Renamed = nil
+			for range outs {
+				if cursor >= len(c.Outbounds) {
+					return reps, nil, provider.ErrDependency
+				}
+				reps[i].Nodes = append(reps[i].Nodes, c.Outbounds[cursor].Name)
+				cursor++
+			}
+			continue
+		}
 		for _, n := range res.Nodes {
 			if keep != nil && !keep(n.Options.Name, n.Options.Type) {
 				continue
@@ -804,4 +924,50 @@ func CheckProviders(c Config) ([]ProviderReport, []GroupReport, error) {
 		groups = append(groups, GroupReport{g.Name, g.Type, len(g.Members)})
 	}
 	return reps, groups, nil
+}
+
+// RefreshProvider refreshes only an existing provider using its actual fetch /
+// parser / cache policy. Failure leaves previous nodes and generation usable.
+func (s *Server) RefreshProvider(ctx context.Context, name string) (ProviderView, error) {
+	k := s.core
+	k.provMu.Lock()
+	p := k.providers[name]
+	k.provMu.Unlock()
+	if p == nil {
+		return ProviderView{}, errors.New("unknown provider")
+	}
+	if e := p.update(ctx); e != nil {
+		return ProviderView{}, e
+	}
+	if ctx.Err() != nil {
+		return ProviderView{}, ctx.Err()
+	}
+
+	for _, v := range k.providerViews() {
+		if v.Name == name {
+			if v.LastErr != "" {
+				v.LastErr = "Provider update failed; previous nodes retained"
+			}
+			return v, nil
+		}
+	}
+	return ProviderView{}, errors.New("provider no longer configured")
+}
+
+// ProviderRefreshTimeout is the selected provider's actual request budget.
+// Read from the active provider instance, not a stale unexpanded document.
+func (s *Server) ProviderRefreshTimeout(name string) (time.Duration, error) {
+	s.core.provMu.Lock()
+	p := s.core.providers[name]
+	s.core.provMu.Unlock()
+	if p == nil {
+		return 0, errors.New("unknown provider")
+	}
+	return p.refreshTimeout(), nil
+}
+func (p *providerRT) refreshTimeout() time.Duration {
+	if p.cfg.Timeout != 0 {
+		return p.cfg.Timeout.value()
+	}
+	return defaultProviderTimeout
 }

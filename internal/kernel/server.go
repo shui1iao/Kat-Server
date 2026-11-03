@@ -192,6 +192,7 @@ func (k *core) shutdownCore() {
 }
 
 func Start(c Config) (*Server, error) {
+	c.DNS = cloneDNSOptions(c.DNS)
 	// Embedders have no Load bytes: capture the unprepared configuration too.
 	if len(c.raw) == 0 {
 		b, e := json.Marshal(c)
@@ -212,7 +213,16 @@ func Start(c Config) (*Server, error) {
 	k.openState(&c)
 	k.reloadMu.Lock()
 	prov := k.syncProviders(&c, true)
-	prov.notes = append(prov.notes, expandProviders(&c, prov.next)...)
+	notes, expandErr := expandProviders(&c, prov.next)
+	if expandErr == nil {
+		expandErr = prov.err
+	}
+	if expandErr != nil {
+		k.reloadMu.Unlock()
+		k.shutdownCore()
+		return nil, expandErr
+	}
+	prov.notes = append(prov.notes, notes...)
 	if e := c.Validate(); e != nil {
 		k.reloadMu.Unlock()
 		k.shutdownCore()

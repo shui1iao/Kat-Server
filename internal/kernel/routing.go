@@ -15,10 +15,9 @@ func (r RouteRule) matchDomain(name string) bool {
 	return name != "" && (r.Domain == name || r.DomainSuffix != "" && (name == r.DomainSuffix || strings.HasSuffix(name, "."+r.DomainSuffix)))
 }
 
-// networkPolicy is false for the default configuration (system DNS, no rules,
-// final direct): TCP and UDP then keep the original resolve-and-dial fast path.
+// Only explicit system DNS with no rules/final proxy keeps the original fast path.
 func (s *Server) networkPolicy() bool {
-	return s.dns != nil && s.dns.ep.scheme != "system" || s.cfg.Routing != nil && (len(s.cfg.Routing.Rules) > 0 || s.cfg.Routing.Final != "" && s.cfg.Routing.Final != "direct")
+	return s.dns != nil && len(s.dns.upstreams) > 0 || s.cfg.Routing != nil && (len(s.cfg.Routing.Rules) > 0 || s.cfg.Routing.Final != "" && s.cfg.Routing.Final != "direct")
 }
 
 // routeDirect is the legacy (pre-engine) per-candidate evaluation of legacy

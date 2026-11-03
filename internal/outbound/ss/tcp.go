@@ -485,3 +485,9 @@ func parseAddr(b []byte) (outbound.Addr, int, error) {
 	}
 	return outbound.Addr{Host: host, Port: binary.BigEndian.Uint16(b[end:])}, end + 2, nil
 }
+
+// IsProxyFailure recognizes only typed/sentinel authentication or malformed proxy replies.
+// Destination rejection and ambiguous EOF/timeouts deliberately do not match.
+func IsProxyFailure(err error) bool {
+	return errors.Is(err, errAuth) || errors.Is(err, errFormat) || errors.Is(err, errTime) || errors.Is(err, errSalt)
+}

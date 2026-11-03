@@ -115,8 +115,14 @@ func TestLoadBalanceStickyTTLSourceHealth(t *testing.T) {
 		t.Fatal("sticky member still down")
 	}
 	g.realSuccess(a, key, 0, false)
+	if g.lbUpLocked(a) {
+		t.Fatal("one success bypassed recovery")
+	}
+	clk.Advance(5 * time.Second)
+	g.realSuccess(a, key, 0, false)
+	clk.Advance(5 * time.Second)
 	if !g.lbUpLocked(a) {
-		t.Fatal("not restored")
+		t.Fatal("not restored after stable recovery")
 	}
 	t.Log("sticky source isolation, fixed 10m TTL, failed-probe skip, max-failure skip, traffic recovery passed")
 }
