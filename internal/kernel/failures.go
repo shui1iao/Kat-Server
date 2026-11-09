@@ -141,7 +141,7 @@ func quietFailure(e error) bool {
 	if errors.As(e, &h) && h.EmptyEOF() {
 		return true
 	}
-	return e == nil || errors.Is(e, io.EOF) || errors.Is(e, net.ErrClosed) || errors.Is(e, os.ErrClosed) || errors.Is(e, context.Canceled) || errors.Is(e, io.ErrClosedPipe) || errors.Is(e, syscall.ECONNRESET) || errors.Is(e, syscall.EPIPE)
+	return e == nil || errors.Is(e, io.EOF) || errors.Is(e, net.ErrClosed) || errors.Is(e, os.ErrClosed) || errors.Is(e, context.Canceled) || errors.Is(e, io.ErrClosedPipe) || errors.Is(e, syscall.ECONNRESET) || errors.Is(e, syscall.ECONNABORTED) || errors.Is(e, syscall.EPIPE)
 }
 func anyTLSFailure(e error) (failureKind, bool) {
 	if quietFailure(e) || errors.Is(e, A.ErrStreamClosed) {

@@ -1,10 +1,10 @@
-# Kat-Server v0.7.2
+# Kat-Server v0.8.0
 
 本版变更、默认值变化及测试边界以[发布说明](RELEASE_NOTES.md)为准。以下功能文档继承原服务端；命令及模块路径不改。
 
 # Kat
 
-Kat 是用 Go 编写的 Linux 服务端代理内核，提供有界资源管理、TCP/UDP 转发、上游代理、策略组与规则分流。当前版本 **0.7.2**，在 0.7.0 基础上修复 AnyTLS 旧会话授权撤销与 API/统计/选择状态热重载原子性，并增加 AnyTLS 入站自定义 padding 方案；既有功能、默认值和正式协议范围不变。命令名为 `kat`，模块名为 `github.com/shui1iao/Kat`。本项目不提供图形客户端、TUN 或公网管理接口；本机管理接口只监听 Unix socket 或回环地址。升级变化及限制见 [发布说明](RELEASE_NOTES.md)。
+Kat 是用 Go 编写的 Linux 服务端代理内核，提供有界资源管理、TCP/UDP 转发、上游代理、策略组与规则分流。当前版本 **0.8.0**，在 0.7.0 基础上修复 AnyTLS 旧会话授权撤销与 API/统计/选择状态热重载原子性，并增加 AnyTLS 入站自定义 padding 方案；既有功能、默认值和正式协议范围不变。命令名为 `kat`，模块名为 `github.com/shui1iao/Kat`。本项目不提供图形客户端、TUN 或公网管理接口；本机管理接口只监听 Unix socket 或回环地址。升级变化及限制见 [发布说明](RELEASE_NOTES.md)。
 
 ## 入站协议范围
 

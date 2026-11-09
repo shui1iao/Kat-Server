@@ -1,1 +1,1 @@
-Kat 0.7.1：热重载修复与 AnyTLS 自定义 padding
+Kat-Server v0.8.0

@@ -163,7 +163,7 @@ func (s *Server) relayIdle(ctx context.Context, a, b net.Conn, idle time.Duratio
 	}
 	select {
 	case e := <-done:
-		if err == nil {
+		if err == nil && !quietFailure(e) {
 			err = e
 		}
 	case <-ctx.Done():
