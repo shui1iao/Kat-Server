@@ -1,12 +1,10 @@
 package kernel
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
 	"time"
 
 	"github.com/shui1iao/Kat/internal/stats"
@@ -16,12 +14,12 @@ import (
 // together). Reset and both savers take saveMu first. A candidate holds the
 // old instance lock until commit, and owns the new lock until commit/abort.
 type statePlan struct {
-	k                         *core
-	want, persist, selectPath string
-	release                   func()
-	changed                   bool
-	files                     []*stateFile
-	held                      bool
+	k             *core
+	want, persist string
+	release       func()
+	changed       bool
+	files         []*stateFile
+	held          bool
 }
 
 // stateFile is a bounded in-process rename undo record, not crash recovery.
@@ -129,7 +127,7 @@ func (f *stateFile) undo() error {
 	return e
 }
 
-func (k *core) prepareState(c *Config, selections map[string]selRecord) (*statePlan, error) {
+func (k *core) prepareState(c *Config) (*statePlan, error) {
 	k.saveMu.Lock()
 	p := &statePlan{k: k, held: true}
 	fail := func(e error) (*statePlan, error) { p.abort(); return nil, e }
@@ -137,7 +135,7 @@ func (k *core) prepareState(c *Config, selections map[string]selRecord) (*stateP
 		p.want = c.Stats.File
 	}
 	k.statsMu.Lock()
-	cur, oldStats, oldSelect := k.lockedFile, k.statsPath, k.selPath
+	cur, oldStats := k.lockedFile, k.statsPath
 	k.statsMu.Unlock()
 	// Clean aliases must not contend with the instance's own lock.
 	same := p.want == cur
@@ -159,19 +157,12 @@ func (k *core) prepareState(c *Config, selections map[string]selRecord) (*stateP
 		}
 		p.release = release
 	}
-	if p.want != "" {
-		p.selectPath = selectStatePath(p.want)
-	}
 	if c.persistStats() && p.want != "" {
 		p.persist = p.want
 	}
 	// Unchanged persistence paths do not need a probe or rewrite. A failed
 	// startup lock/load is retried when reload requests that resource again.
 	needStats := p.persist != "" && (p.changed || p.persist != oldStats)
-	k.selMu.Lock()
-	selectionsChanged := !reflect.DeepEqual(selections, k.selections)
-	k.selMu.Unlock()
-	needSelect := p.selectPath != "" && (p.changed || p.selectPath != oldSelect || selectionsChanged)
 	type request struct {
 		path  string
 		write func(string) error
@@ -183,14 +174,6 @@ func (k *core) prepareState(c *Config, selections map[string]selRecord) (*stateP
 	}
 	if needStats {
 		reqs = append(reqs, request{p.persist, save})
-	}
-	if needSelect {
-		b, e := json.MarshalIndent(selFile{Version: selFileVersion, Groups: selections}, "", "  ")
-		if e != nil {
-			return fail(e)
-		}
-		b = append(b, '\n')
-		reqs = append(reqs, request{p.selectPath, func(path string) error { return writeFileAtomic(path, b) }})
 	}
 	// New destinations win if a path is deliberately reused in a rotation.
 	seen := map[string]bool{}
@@ -250,7 +233,7 @@ func (p *statePlan) commit() {
 		k.statsRelease = p.release
 		p.release = nil
 	}
-	k.lockedFile, k.statsPath, k.selPath = p.want, p.persist, p.selectPath
+	k.lockedFile, k.statsPath = p.want, p.persist
 	k.statsMu.Unlock()
 	if p.changed && oldRelease != nil {
 		oldRelease()

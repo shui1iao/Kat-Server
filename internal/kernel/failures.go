@@ -9,10 +9,13 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // Fixed categories only: never index by input, identity, peer or target.
@@ -29,7 +32,6 @@ const (
 	failAnyBudget
 	failAnyIO
 	failDNS
-	failRoute
 	failDial
 	failDialBudget
 	failUDPInvalid
@@ -39,9 +41,6 @@ const (
 	failUDPIO
 	failUDPSource
 	failTCPIO
-	failOutboundDial // proxy outbound/group dial or UDP session setup failed
-	failOutboundUDP  // outbound (or its chain/group) cannot carry UDP
-	failRuleData     // rule set / GeoIP file or download unavailable
 	failBlocked      // destination refused by the security options (loopback/private)
 	failSourceBanned // 0.7.0: source temporarily banned after authentication failures
 	failSourceDenied // source refused by the inbound's source lists
@@ -58,13 +57,12 @@ var failureLabels = [failureKinds]string{
 	"stage=handshake reason=authentication_or_format", "stage=anytls reason=authentication_failed",
 	"stage=anytls reason=protocol_violation", "stage=anytls reason=session_or_stream_budget",
 	"stage=anytls reason=session_io", "stage=resolve reason=dns_failed",
-	"stage=route reason=rule_reject", "stage=dial reason=connect_failed",
+	"stage=dial reason=connect_failed",
 	"stage=dial reason=budget_wait_timeout", "stage=udp reason=authentication_replay_or_format",
 	"stage=udp reason=association_or_handshake_limit", "stage=udp reason=queue_limit",
 	"stage=udp reason=target_limit", "stage=udp reason=socket_io",
 	"stage=udp reason=unauthorized_source_or_expired", "stage=relay reason=stream_io",
-	"stage=outbound reason=proxy_connect_failed", "stage=outbound reason=udp_unsupported",
-	"stage=route reason=rule_data_unavailable", "stage=dial reason=destination_not_allowed",
+	"stage=dial reason=destination_not_allowed",
 	"stage=admission reason=source_banned", "stage=admission reason=source_not_allowed",
 	"stage=admission reason=per_ip_limit", "stage=fallback reason=connect_failed",
 	"stage=bind reason=no_free_port", "stage=bind reason=timeout",
@@ -162,10 +160,6 @@ func (s *Server) outboundFailure(e error) {
 	if quietFailure(e) {
 		return
 	}
-	if errors.Is(e, errRouteReject) {
-		s.failure(failRoute, "outbound", -1)
-		return
-	}
 	var dns *net.DNSError
 	if errors.Is(e, errDNS) || errors.As(e, &dns) {
 		s.failure(failDNS, "outbound", -1)
@@ -178,11 +172,24 @@ func (s *Server) resolutionFailure(e error) {
 	if quietFailure(e) {
 		return
 	}
-	if errors.Is(e, errRouteReject) {
-		s.failure(failRoute, "outbound", -1)
-	} else {
-		s.failure(failDNS, "outbound", -1)
+	s.failure(failDNS, "outbound", -1)
+}
+
+func eventToken(s string, max int) string {
+	var b strings.Builder
+	for _, c := range s {
+		if b.Len() >= max {
+			break
+		}
+		if c == utf8.RuneError || unicode.IsControl(c) || unicode.IsSpace(c) || c == '=' || c == '"' {
+			c = '_'
+		}
+		b.WriteRune(c)
 	}
+	if b.Len() == 0 {
+		return "_"
+	}
+	return b.String()
 }
 
 // WriteDiagnosticLine is used only for the CLI's finite startup/exit messages.

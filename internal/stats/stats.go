@@ -83,9 +83,8 @@ type Registry struct {
 type keyset struct {
 	inbounds  map[string]*Counter
 	outbounds map[string]*Counter
-	groups    map[string]*Counter
 	rules     map[string]*RuleCounter
-	order     struct{ inbounds, outbounds, groups, rules []string }
+	order     struct{ inbounds, outbounds, rules []string }
 }
 
 const rateSamples = 6 // one per second: rate over the last five seconds
@@ -108,34 +107,31 @@ func uniq(keys []string) []string {
 }
 
 // New creates a registry with zeroed counters for the given keys.
-func New(inbounds, outbounds, groups, rules []string, now time.Time) *Registry {
+func New(inbounds, outbounds, rules []string, now time.Time) *Registry {
 	r := &Registry{}
-	r.keys.Store(&keyset{inbounds: map[string]*Counter{}, outbounds: map[string]*Counter{}, groups: map[string]*Counter{}, rules: map[string]*RuleCounter{}})
-	r.Rekey(inbounds, outbounds, groups, rules)
+	r.keys.Store(&keyset{inbounds: map[string]*Counter{}, outbounds: map[string]*Counter{}, rules: map[string]*RuleCounter{}})
+	r.Rekey(inbounds, outbounds, rules)
 	r.since.Store(now.UnixNano())
 	return r
 }
 
 // Rekey makes the given keys the visible key set. Existing counters are kept
 // by name; new names start at zero.
-func (r *Registry) Rekey(inbounds, outbounds, groups, rules []string) {
+func (r *Registry) Rekey(inbounds, outbounds, rules []string) {
 	r.keyMu.Lock()
 	defer r.keyMu.Unlock()
 	old := r.keys.Load()
-	k := &keyset{inbounds: map[string]*Counter{}, outbounds: map[string]*Counter{}, groups: map[string]*Counter{}, rules: map[string]*RuleCounter{}}
+	k := &keyset{inbounds: map[string]*Counter{}, outbounds: map[string]*Counter{}, rules: map[string]*RuleCounter{}}
 	for n, c := range old.inbounds {
 		k.inbounds[n] = c
 	}
 	for n, c := range old.outbounds {
 		k.outbounds[n] = c
 	}
-	for n, c := range old.groups {
-		k.groups[n] = c
-	}
 	for n, c := range old.rules {
 		k.rules[n] = c
 	}
-	k.order.inbounds, k.order.outbounds, k.order.groups, k.order.rules = uniq(inbounds), uniq(outbounds), uniq(groups), uniq(rules)
+	k.order.inbounds, k.order.outbounds, k.order.rules = uniq(inbounds), uniq(outbounds), uniq(rules)
 	for _, n := range k.order.inbounds {
 		if k.inbounds[n] == nil {
 			k.inbounds[n] = &Counter{}
@@ -144,11 +140,6 @@ func (r *Registry) Rekey(inbounds, outbounds, groups, rules []string) {
 	for _, n := range k.order.outbounds {
 		if k.outbounds[n] == nil {
 			k.outbounds[n] = &Counter{}
-		}
-	}
-	for _, n := range k.order.groups {
-		if k.groups[n] == nil {
-			k.groups[n] = &Counter{}
 		}
 	}
 	for _, n := range k.order.rules {
@@ -161,7 +152,6 @@ func (r *Registry) Rekey(inbounds, outbounds, groups, rules []string) {
 
 func (r *Registry) Inbound(k string) *Counter  { return r.keys.Load().inbounds[k] }
 func (r *Registry) Outbound(k string) *Counter { return r.keys.Load().outbounds[k] }
-func (r *Registry) Group(k string) *Counter    { return r.keys.Load().groups[k] }
 func (r *Registry) Rule(k string) *RuleCounter { return r.keys.Load().rules[k] }
 
 // Snapshot is the cumulative view returned by the management API.
@@ -170,21 +160,17 @@ type Snapshot struct {
 	Total     Traffic     `json:"total"`
 	Inbounds  []Named     `json:"inbounds"`
 	Outbounds []Named     `json:"outbounds"`
-	Groups    []Named     `json:"groups"`
 	Rules     []NamedRule `json:"rules"`
 }
 
 func (r *Registry) Snapshot() Snapshot {
-	s := Snapshot{Since: time.Unix(0, r.since.Load()), Total: r.Total.Load(), Inbounds: []Named{}, Outbounds: []Named{}, Groups: []Named{}, Rules: []NamedRule{}}
+	s := Snapshot{Since: time.Unix(0, r.since.Load()), Total: r.Total.Load(), Inbounds: []Named{}, Outbounds: []Named{}, Rules: []NamedRule{}}
 	ks := r.keys.Load()
 	for _, k := range ks.order.inbounds {
 		s.Inbounds = append(s.Inbounds, Named{k, ks.inbounds[k].Load()})
 	}
 	for _, k := range ks.order.outbounds {
 		s.Outbounds = append(s.Outbounds, Named{k, ks.outbounds[k].Load()})
-	}
-	for _, k := range ks.order.groups {
-		s.Groups = append(s.Groups, Named{k, ks.groups[k].Load()})
 	}
 	for _, k := range ks.order.rules {
 		c := ks.rules[k]
@@ -202,9 +188,6 @@ func (r *Registry) Reset(now time.Time) {
 		c.reset()
 	}
 	for _, c := range ks.outbounds {
-		c.reset()
-	}
-	for _, c := range ks.groups {
 		c.reset()
 	}
 	for _, c := range ks.rules {
@@ -313,11 +296,6 @@ func (r *Registry) Load(path string) error {
 			c.add(t)
 		}
 	}
-	for k, t := range v.Groups {
-		if c := ks.groups[k]; c != nil {
-			c.add(t)
-		}
-	}
 	for k, t := range v.Rules {
 		if c := ks.rules[k]; c != nil {
 			c.add(Traffic{t.Up, t.Down})
@@ -341,9 +319,6 @@ func (r *Registry) Save(path string, now time.Time) error {
 	}
 	for _, n := range s.Outbounds {
 		v.Outbounds[n.Name] = n.Traffic
-	}
-	for _, n := range s.Groups {
-		v.Groups[n.Name] = n.Traffic
 	}
 	for _, n := range s.Rules {
 		v.Rules[n.Name] = n.RuleTraffic

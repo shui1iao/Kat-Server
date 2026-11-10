@@ -40,9 +40,6 @@ type Backend interface {
 	// Reload re-reads the configuration file and installs it. A *Failure
 	// reports a refused configuration (the running one is unchanged).
 	Reload() (result any, err error)
-	// SelectGroups lists the select groups; Select switches one of them.
-	SelectGroups() any
-	Select(group, member string) error
 	// Bans lists the sources banned after authentication failures;
 	// RemoveBan lifts one (found is false when it was not banned).
 	Bans() any
@@ -267,15 +264,7 @@ func (p *Prepared) Commit() *Server {
 	p.dirs = nil
 	return s
 }
-func (s *Server) Addrs() []net.Addr {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]net.Addr, len(s.endpoints))
-	for i, e := range s.endpoints {
-		out[i] = e.ln.Addr()
-	}
-	return out
-}
+
 func (s *Server) Close() {
 	if s == nil {
 		return
@@ -461,37 +450,6 @@ func handler(b Backend, debug func(string, string, int)) http.Handler {
 			writeError(w, http.StatusInternalServerError, "reload_failed", e.Error())
 		default:
 			writeJSON(w, http.StatusOK, res)
-		}
-	})
-	mux.HandleFunc("GET /v1/select", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, b.SelectGroups())
-	})
-	mux.HandleFunc("PUT /v1/select/{group}", func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Member string `json:"member"`
-		}
-		d := json.NewDecoder(io.LimitReader(r.Body, 4096))
-		d.DisallowUnknownFields()
-		if e := d.Decode(&req); e != nil || req.Member == "" {
-			writeError(w, http.StatusBadRequest, "bad_request", `body must be {"member":"NAME"}`)
-			return
-		}
-		e := b.Select(r.PathValue("group"), req.Member)
-		var f *Failure
-		switch {
-		case errors.As(e, &f):
-			status := http.StatusBadRequest
-			switch f.Code {
-			case "unknown_group":
-				status = http.StatusNotFound
-			case "not_select":
-				status = http.StatusConflict
-			}
-			writeError(w, status, f.Code, f.Message)
-		case e != nil:
-			writeError(w, http.StatusInternalServerError, "select_failed", e.Error())
-		default:
-			writeJSON(w, http.StatusOK, map[string]string{"group": r.PathValue("group"), "selected": req.Member})
 		}
 	})
 	mux.HandleFunc("GET /v1/bans", func(w http.ResponseWriter, r *http.Request) {

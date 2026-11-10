@@ -1,6 +1,6 @@
 # TLS 证书、ACME 自动证书与 TCP Fast Open（0.7.0）
 
-本文说明 0.7.0 新增的入站 TLS 选项（Trojan / AnyTLS）、出站 uTLS 指纹、ACME 自动证书和 TCP Fast Open。所有新字段都是可选的：不写时保留原有 TLS/TCP 行为。
+本文说明入站 TLS 选项（Trojan / AnyTLS）、ACME 自动证书和 TCP Fast Open。所有新字段都是可选的：不写时保留原有 TLS/TCP 行为。
 
 ## 入站 TLS（Trojan / AnyTLS）
 
@@ -84,14 +84,6 @@
 
 **热重载**：ACME 配置不变（含 Token）时，reload 沿用同一个证书管理器与证书，不会重新申请；配置变化时按新配置申请。
 
-## 出站 uTLS 指纹（Trojan / AnyTLS 出站）
-
-```json
-"tls": {"server_name": "example.com", "fingerprint": "chrome"}
-```
-
-`fingerprint` 可选值：`chrome`、`firefox`、`safari`、`ios`、`edge`、`android`、`360`、`qq`、`random`（进程启动后从 chrome/firefox/safari/ios/edge 中随机固定一个）。不写时使用 Go 自带的 TLS 实现，保留原有行为。证书校验方式（默认校验、`ca`、`pin_sha256`、`insecure`）不变；写了 `alpn` 时替换浏览器模板里的 ALPN 列表。
-
 ## TCP Fast Open
 
 ```json
@@ -102,5 +94,5 @@
 ```
 
 - 入站 `tcp_fast_open`（默认 `false`）：监听 socket 接受 SYN 中携带的数据。reload 时可开关，复用的监听 socket 也会随之更新。
-- 根 `direct.tcp_fast_open`（默认 `false`）：内置 direct 出站（包括连到上游代理服务器的第一跳）发起连接时启用 TFO，第一段数据在已有 cookie 时随 SYN 发出。
+- 根 `direct.tcp_fast_open`（默认 `false`）：内置 direct 出站发起连接时启用 TFO，第一段数据在已有 cookie 时随 SYN 发出。
 - Kat 不修改系统参数。启动和 reload 时读取 `net.ipv4.tcp_fastopen`：入站需要第 2 位（值含 2），direct 需要第 1 位（值含 1），不满足时告警，例如 `kat event=tfo_sysctl_insufficient side=server sysctl=net.ipv4.tcp_fastopen value=1 required_bit=0x2 effect=inbound_tfo_inactive hint=set_net.ipv4.tcp_fastopen_to_3`。此时连接照常建立，只是不使用 TFO。非 Linux 平台上该选项被忽略并告警。

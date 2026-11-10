@@ -15,8 +15,6 @@ import (
 	"lukechampine.com/blake3"
 	"net"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -278,17 +276,12 @@ func TestSSNativeLimitsIdleAndFD(t *testing.T) {
 	waitFor(t, func() bool { f, _ := os.ReadDir("/proc/self/fd"); return len(f) <= len(baseline)+1 })
 }
 func TestEncryptedConfigAndIdle(t *testing.T) {
-	for _, in := range []Inbound{{Protocol: "shadowsocks", SS: &SSOptions{Method: "aes-128-cfb", Password: "x"}}, {Protocol: "shadowsocks", SS: &SSOptions{Method: "2022-blake3-aes-128-gcm", Password: "bad"}}, {Protocol: "snell", Snell: &SnellOptions{Version: 6, PSK: "x"}}, {Protocol: "snell", Snell: &SnellOptions{Version: 4, PSK: "x", Obfs: "tls"}}} {
+	for _, in := range []Inbound{{Protocol: "shadowsocks", SS: &SSOptions{Method: "aes-128-cfb", Password: "x"}}, {Protocol: "shadowsocks", SS: &SSOptions{Method: "2022-blake3-aes-128-gcm", Password: "bad"}}} {
 		in.Listen = "127.0.0.1:0"
 		c := Config{Inbounds: []Inbound{in}}
 		if c.Validate() == nil {
 			t.Fatal("unsupported encrypted config accepted")
 		}
-	}
-	sn := Inbound{Protocol: "snell", Snell: &SnellOptions{Version: 4, PSK: "snell-fixture", Obfs: "none"}}
-	s := startTest(t, sn, nil)
-	if s.cfg.Inbounds[0].snellServer == nil {
-		t.Fatal("missing codec")
 	}
 	target := echoTCP(t)
 	old := startTest(t, inFor("socks5", nil), func(c *Config) { c.Limits.TCPIdle = Duration(40 * time.Millisecond) })
@@ -310,79 +303,6 @@ func TestDatagramQueueByteBudget(t *testing.T) {
 		t.Fatal("UDP byte budget not enforced")
 	}
 }
-func TestSnellSamePSKShared(t *testing.T) {
-	in := Inbound{Protocol: "snell", Snell: &SnellOptions{Version: 4, PSK: "shared-psk", Obfs: "none"}}
-	s := startTest(t, in, func(c *Config) {
-		c.Inbounds = append(c.Inbounds, Inbound{Protocol: "snell", Listen: "127.0.0.1:0", Snell: &SnellOptions{Version: 5, PSK: "shared-psk", Obfs: "none"}})
-	})
-	if s.cfg.Inbounds[0].snellServer != s.cfg.Inbounds[1].snellServer {
-		t.Fatal("same Snell PSK not shared")
-	}
-}
-
-func TestSnellIntegratedReplayRejectAndStop(t *testing.T) {
-	peer := os.Getenv("KAT_SNELL_PEER")
-	if peer == "" {
-		t.Skip("set KAT_SNELL_PEER to independent fixed client")
-	}
-	var accepts atomic.Int64
-	target := sinkTCP(t, "tcp4", "127.0.0.1:0", func(c net.Conn) { accepts.Add(1); io.Copy(c, c) })
-	in := Inbound{Protocol: "snell", Snell: &SnellOptions{Version: 4, PSK: "snell-core-fixture-psk", Obfs: "none", ReplayCapacity: 2}}
-	s := startTest(t, in, func(c *Config) {
-		c.Inbounds = append(c.Inbounds, Inbound{Protocol: "snell", Listen: "127.0.0.1:0", Snell: &SnellOptions{Version: 5, PSK: "snell-core-fixture-psk", Obfs: "none", ReplayCapacity: 2}})
-	})
-	wire := captureSnell(t, peer, target)
-	c := dialPeer(t, s, nil)
-	writeAll(c, wire)
-	waitFor(t, func() bool { return accepts.Load() == 1 })
-	c.Close()
-	waitFor(t, func() bool { return s.Stats().Active == 0 })
-	for _, bad := range [][]byte{wire, func() []byte { b := bytes.Clone(wire); b[20] ^= 1; return b }()} {
-		c, e := net.Dial("tcp", s.Addresses()[1].String())
-		if e != nil {
-			t.Fatal(e)
-		}
-		c.SetDeadline(time.Now().Add(time.Second))
-		writeAll(c, bad)
-		var b [256]byte
-		if n, e := c.Read(b[:]); e == nil || n > 0 {
-			t.Fatal("bad Snell returned data")
-		}
-		c.Close()
-	}
-	if accepts.Load() != 1 {
-		t.Fatal("Snell unauthenticated/replay target dial")
-	}
-	// A second valid request retains an unfinished client input. Service stop must
-	// cancel and join it, rather than leaving a session/target/socket behind.
-	c = dialPeer(t, s, nil)
-	wire2 := captureSnell(t, peer, target)
-	if len(wire2) < 23 {
-		t.Fatal("short capture")
-	}
-	writeAll(c, wire2[:len(wire2)-23])
-	waitFor(t, func() bool { return accepts.Load() == 2 })
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
-	defer cancel()
-	_ = s.Close(ctx)
-	if got := s.Stats(); got.Active != 0 || got.Handshakes != 0 {
-		t.Fatal("Snell resources not released", got)
-	}
-}
-func captureSnell(t *testing.T, peer string, target Address) []byte {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "request.bin")
-	out, e := exec.Command(peer, "-capture", path, "-target1", target.String()).CombinedOutput()
-	if e != nil {
-		t.Fatalf("capture %v %s", e, out)
-	}
-	b, e := os.ReadFile(path)
-	if e != nil {
-		t.Fatal(e)
-	}
-	return b
-}
-
 func TestSSAdmissionRST(t *testing.T) {
 	s := startTest(t, ssIn(), func(c *Config) { c.Limits.Handshakes = 1 })
 	c := dialPeer(t, s, nil)
@@ -401,10 +321,6 @@ func TestSharedIdentityConfigConflicts(t *testing.T) {
 	c := Config{Inbounds: []Inbound{a, b}}
 	if c.Validate() == nil {
 		t.Fatal("conflicting SS protection config accepted")
-	}
-	c = Config{Inbounds: []Inbound{{Protocol: "snell", Listen: "127.0.0.1:0", Snell: &SnellOptions{Version: 4, PSK: "same", Obfs: "none"}}, {Protocol: "snell", Listen: "127.0.0.1:0", Snell: &SnellOptions{Version: 5, PSK: "same", Obfs: "http"}}}}
-	if c.Validate() == nil {
-		t.Fatal("conflicting Snell identity obfs accepted without shared protection")
 	}
 }
 

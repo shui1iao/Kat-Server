@@ -12,12 +12,11 @@ func TestSaveLoadByName(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "a", "s.json")
 	now := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
-	r := New([]string{"socks5/1", "ss/2"}, []string{"direct", "up"}, []string{"g"}, []string{"final->direct", "domain:x->up"}, now)
+	r := New([]string{"socks5/1", "ss/2"}, []string{"direct", "up"}, []string{"final->direct", "domain:x->up"}, now)
 	r.Total.AddUp(10)
 	r.Total.AddDown(20)
 	r.Inbound("ss/2").AddUp(10)
 	r.Outbound("up").AddDown(20)
-	r.Group("g").AddDown(20)
 	r.Rule("domain:x->up").Hit()
 	r.Rule("domain:x->up").AddUp(10)
 	if e := r.Save(path, now); e != nil {
@@ -30,7 +29,7 @@ func TestSaveLoadByName(t *testing.T) {
 		t.Fatal("temporary file left", m)
 	}
 	// Different order and a removed key: values follow the names.
-	q := New([]string{"ss/2"}, []string{"up", "direct"}, nil, []string{"domain:x->up", "final->direct"}, now.Add(time.Hour))
+	q := New([]string{"ss/2"}, []string{"up", "direct"}, []string{"domain:x->up", "final->direct"}, now.Add(time.Hour))
 	if e := q.Load(path); e != nil {
 		t.Fatal(e)
 	}
@@ -47,7 +46,7 @@ func TestSaveLoadByName(t *testing.T) {
 
 func TestLoadMissingAndCorrupt(t *testing.T) {
 	dir := t.TempDir()
-	r := New(nil, nil, nil, nil, time.Now())
+	r := New(nil, nil, nil, time.Now())
 	if e := r.Load(filepath.Join(dir, "none.json")); e != nil {
 		t.Fatal(e)
 	}
@@ -73,7 +72,7 @@ func TestLoadMissingAndCorrupt(t *testing.T) {
 
 func TestRate(t *testing.T) {
 	now := time.Now()
-	r := New(nil, nil, nil, nil, now)
+	r := New(nil, nil, nil, now)
 	if up, down, w := r.Rate(); up != 0 || down != 0 || w != 0 {
 		t.Fatal("rate without samples")
 	}

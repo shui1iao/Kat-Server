@@ -97,9 +97,6 @@ func ss2022Ready(c net.Conn) int {
 // that fills the relay buffer is extended, without blocking, with bytes the
 // target socket already holds, and the result is written in one Write, so the
 // SS2022 writer emits one record of up to ss.MaxChunk2022 payload bytes.
-func (s *Server) copySS2022Down(dst, src net.Conn, target *ss2022DownConn) error {
-	return s.copySS2022DownM(dst, src, target, meter{})
-}
 
 func (s *Server) copySS2022DownM(dst, src net.Conn, target *ss2022DownConn, m meter) error {
 	small := s.pool.get()

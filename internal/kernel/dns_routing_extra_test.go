@@ -48,41 +48,10 @@ func TestDNSRoutingCNAMEExpiryAndUnrelatedAnswers(t *testing.T) {
 	}
 }
 
-func TestDNSRoutingDeniedCandidateNetworkCounters(t *testing.T) {
-	var deniedTCP atomic.Int64
-	allowed := sinkTCP(t, "tcp4", "127.0.0.1:0", func(c net.Conn) { io.Copy(c, c) })
-	sinkTCP(t, "tcp4", net.JoinHostPort("127.0.0.2", itoaPort(allowed.Port)), func(c net.Conn) { deniedTCP.Add(1) })
-	target := localUDP(t)
-	blocked, e := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 2), Port: target.LocalAddr().(*net.UDPAddr).Port})
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer blocked.Close()
-	f := newDNSFixture(t, func(w []byte) []byte { return dnsReply(w, []string{"127.0.0.2", "127.0.0.1"}, 30) })
-	s := startTest(t, ssIn(), func(c *Config) {
-		c.DNS = &DNSOptions{Server: f.address()}
-		c.Routing = &RoutingOptions{Rules: []RouteRule{{IPCIDR: "127.0.0.2/32", Action: "reject"}}}
-	})
-	c, e := s.dial(context.Background(), Address{"multi.example", allowed.Port})
-	if e != nil {
-		t.Fatal(e)
-	}
-	c.Close()
-	endpoint, _ := net.ResolveUDPAddr("udp", s.Addresses()[0].String())
-	client := localUDP(t)
-	client.WriteToUDP(udp2022(t, Address{"multi.example", addrFromNet(target.LocalAddr()).Port}, 950, 1, []byte("allow")), endpoint)
-	recvUDP(t, target)
-	silentUDP(t, blocked)
-	if deniedTCP.Load() != 0 {
-		t.Fatal("denied IP accepted TCP", deniedTCP.Load())
-	}
-	t.Logf("multi-IP rejected TCP accepts=%d, rejected UDP receives=0; literal allowed address used", deniedTCP.Load())
-}
 func itoaPort(p uint16) string { return strconv.Itoa(int(p)) }
 
 func TestDNSRoutingActualSystemBootstrapLocalhost(t *testing.T) {
 	f := newDNSFixture(t, func(w []byte) []byte { return dnsReply(w, []string{"127.0.0.1"}, 10) })
-	// Cover both addresses returned by the real system localhost resolver, no public DNS.
 	v6, e := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback, Port: f.udp.LocalAddr().(*net.UDPAddr).Port})
 	if e != nil {
 		t.Skipf("IPv6 local bootstrap unavailable: %v", e)
@@ -162,15 +131,4 @@ func TestDNSRoutingDoHCloseAndCancellation(t *testing.T) {
 		t.Fatal("DoH cancellation stuck")
 	}
 	d.close()
-}
-
-func TestDNSRoutingBroadIPv6PrefixValidation(t *testing.T) {
-	c := Config{Routing: &RoutingOptions{Rules: []RouteRule{{IPCIDR: "::ffff:192.0.2.1/80", Action: "reject"}}}}
-	if e := c.validateNetwork(); e != nil {
-		t.Fatal("valid broad IPv6 prefix rejected", e)
-	}
-	s := &Server{cfg: c}
-	if !s.routeDirect("", netip.MustParseAddr("192.0.2.1")) {
-		t.Fatal("broad IPv6 prefix accidentally expanded to IPv4")
-	}
 }

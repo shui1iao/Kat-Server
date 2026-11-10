@@ -324,7 +324,8 @@ func TestAnyTLSPaddingReloadCarriers(t *testing.T) {
 func TestAnyTLSPaddingInvalidReloadUnchanged(t *testing.T) {
 	cert, roots := testCert(t)
 	dir := t.TempDir()
-	base := selectCfg(filepath.Join(dir, "old.stats.json"), "", "direct", "reject", "h")
+	base := socksCfg("127.0.0.1:0")
+	base.Stats = &StatsOptions{File: filepath.Join(dir, "old.stats.json")}
 	base.API = &APIOptions{Socket: filepath.Join(dir, "old.sock"), Listen: reloadPort(t), Secret: "old-padding-api-secret"}
 	in := anyIn(cert)
 	in.Listen = reloadPort(t)
@@ -332,9 +333,6 @@ func TestAnyTLSPaddingInvalidReloadUnchanged(t *testing.T) {
 	base.Limits.UDPIdle = Duration(10 * time.Second)
 	next := base
 	s := startReloadable(t, base, &next)
-	if e := s.Select("g", "h"); e != nil {
-		t.Fatal(e)
-	}
 	old := s.current()
 	codec, auth := old.cfg.Inbounds[0].anytlsServer, old.cfg.Inbounds[0].anytlsAuth
 	ln := s.core.tcpEntries[listenKey(in.Listen)].ln
@@ -355,10 +353,6 @@ func TestAnyTLSPaddingInvalidReloadUnchanged(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	oldSel, e := os.ReadFile(selectStatePath(base.Stats.File))
-	if e != nil {
-		t.Fatal(e)
-	}
 	api := atomicClient(t, "")
 	url := "http://" + base.API.Listen + "/v1/version"
 	for i, scheme := range []string{"stop=0", paddingAtLimit() + "0"} {
@@ -370,7 +364,6 @@ func TestAnyTLSPaddingInvalidReloadUnchanged(t *testing.T) {
 			next.Inbounds[0].AnyTLS = &o
 			next.API = &APIOptions{Socket: filepath.Join(dir, "new.sock"), Listen: reloadPort(t), Secret: "new-padding-api-secret"}
 			next.Stats = &StatsOptions{File: filepath.Join(dir, "new.stats.json")}
-			next.Groups = selectCfg("", "reject", "direct", "reject").Groups
 			stage := "validate"
 			if decode {
 				s.SetConfigLoader(func() (Config, error) {
@@ -396,18 +389,14 @@ func TestAnyTLSPaddingInvalidReloadUnchanged(t *testing.T) {
 				t.Fatal("stats changed")
 			}
 			b, _ := os.ReadFile(base.Stats.File)
-			sel, _ := os.ReadFile(selectStatePath(base.Stats.File))
-			if !bytes.Equal(b, oldBytes) || !bytes.Equal(sel, oldSel) {
-				t.Fatal("stats/select files changed")
-			}
-			if cur, _ := currentOf(t, s, "g"); cur != "h" {
-				t.Fatal("runtime selection changed")
+			if !bytes.Equal(b, oldBytes) {
+				t.Fatal("stats file changed")
 			}
 			if unlock, e := stats.Lock(base.Stats.File); e == nil {
 				unlock()
 				t.Fatal("old stats lock lost")
 			}
-			for _, path := range []string{next.API.Socket, next.Stats.File, selectStatePath(next.Stats.File)} {
+			for _, path := range []string{next.API.Socket, next.Stats.File} {
 				if _, e := os.Lstat(path); !errors.Is(e, os.ErrNotExist) {
 					t.Fatalf("candidate target created: %s: %v", path, e)
 				}

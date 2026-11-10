@@ -291,13 +291,8 @@ func TestServerTLSValidation(t *testing.T) {
 			t.Errorf("good case %d: %v", i, e)
 		}
 	}
-	// Extended options are refused on VLESS.
-	c := Config{Inbounds: []Inbound{{Protocol: "vless", Listen: "127.0.0.1:0", TLS: &TLSConfig{Cert: cp, Key: kp, ALPN: []string{"h2"}}, Users: []User{{UUID: testUUID}}}}}
-	if e := c.Validate(); e == nil {
-		t.Error("VLESS accepted extended TLS options")
-	}
 	// ACME without storage cannot start (the CLI sets the default).
-	c = Config{Inbounds: []Inbound{trojanTLSInbound("127.0.0.1:0", &TLSConfig{ACME: &ACMEConfig{Domains: []string{"a.example"}, Challenge: "tls-alpn-01"}})}}
+	c := Config{Inbounds: []Inbound{trojanTLSInbound("127.0.0.1:0", &TLSConfig{ACME: &ACMEConfig{Domains: []string{"a.example"}, Challenge: "tls-alpn-01"}})}}
 	if s, e := Start(c); e == nil {
 		s.Close(t.Context())
 		t.Error("ACME without storage started")

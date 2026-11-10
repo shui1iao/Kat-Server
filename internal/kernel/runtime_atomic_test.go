@@ -19,18 +19,23 @@ import (
 	"github.com/shui1iao/Kat/internal/stats"
 )
 
+func statsCfg(file string) Config {
+	c := socksCfg("127.0.0.1:0")
+	if file != "" {
+		c.Stats = &StatsOptions{File: file}
+	}
+	return c
+}
+
 func TestRuntimeAtomicBusyRollback(t *testing.T) {
 	for _, kind := range []string{"api", "stats"} {
 		t.Run(kind, func(t *testing.T) {
 			dir := t.TempDir()
-			base := selectCfg(filepath.Join(dir, "old.stats.json"), "", "direct", "reject", "h")
+			base := statsCfg(filepath.Join(dir, "old.stats.json"))
 			base.API = &APIOptions{Socket: filepath.Join(dir, "old.sock")}
 			next := base
 			s := startReloadable(t, base, &next)
-			if e := s.Select("g", "h"); e != nil {
-				t.Fatal(e)
-			}
-			next = selectCfg(filepath.Join(dir, "new.stats.json"), "", "direct", "reject", "h")
+			next = statsCfg(filepath.Join(dir, "new.stats.json"))
 			next.API = &APIOptions{Socket: filepath.Join(dir, "new.sock")}
 			next.Inbounds[0].Users = []User{{Username: "changed", Password: "changed"}}
 			stage := "stats"
@@ -64,9 +69,6 @@ func TestRuntimeAtomicBusyRollback(t *testing.T) {
 			if release, e := stats.Lock(base.Stats.File); e == nil {
 				release()
 				t.Fatal("old lock lost")
-			}
-			if cur, _ := currentOf(t, s, "g"); cur != "h" {
-				t.Fatal("selection lost")
 			}
 		})
 	}
@@ -189,7 +191,7 @@ func TestRuntimeAtomicAPIRequestsAndRotation(t *testing.T) {
 
 func TestRuntimeAtomicPreparedNoServeOrOverwrite(t *testing.T) {
 	dir := t.TempDir()
-	base := selectCfg(filepath.Join(dir, "old.stats.json"), "", "direct", "reject", "h")
+	base := statsCfg(filepath.Join(dir, "old.stats.json"))
 	base.API = &APIOptions{Socket: filepath.Join(dir, "old.sock")}
 	next := base
 	s := startReloadable(t, base, &next)
@@ -197,10 +199,10 @@ func TestRuntimeAtomicPreparedNoServeOrOverwrite(t *testing.T) {
 	if e := s.saveStats(); e != nil {
 		t.Fatal(e)
 	}
-	next = selectCfg(filepath.Join(dir, "new.stats.json"), "", "direct", "reject", "h")
+	next = statsCfg(filepath.Join(dir, "new.stats.json"))
 	next.API = &APIOptions{Socket: filepath.Join(dir, "new.sock")}
 	// A legal preexisting target must not be overwritten or loaded in prepare.
-	target := stats.New(nil, nil, nil, nil, time.Now())
+	target := stats.New(nil, nil, nil, time.Now())
 	target.Total.AddUp(99999)
 	if e := target.Save(next.Stats.File, time.Now()); e != nil {
 		t.Fatal(e)
@@ -231,7 +233,6 @@ func TestRuntimeAtomicPreparedNoServeOrOverwrite(t *testing.T) {
 	}
 	conn.Close()
 	p.abort()
-	g.rt.close()
 	g.dns.close()
 	k.genSeq.Add(^uint64(0))
 	k.reloadMu.Unlock()
@@ -254,22 +255,18 @@ func TestRuntimeAtomicPreparedNoServeOrOverwrite(t *testing.T) {
 }
 
 func TestRuntimeAtomicStateFailuresAndContinuation(t *testing.T) {
-	for _, kind := range []string{"directory", "readonly-file", "readonly-dir", "select-directory", "parent-file", "socket-file", "foreign-socket", "stale-socket"} {
+	for _, kind := range []string{"directory", "readonly-file", "readonly-dir", "parent-file", "socket-file", "foreign-socket", "stale-socket"} {
 		t.Run(kind, func(t *testing.T) {
 			dir := t.TempDir()
-			base := selectCfg(filepath.Join(dir, "old.stats.json"), "", "direct", "reject", "h")
+			base := statsCfg(filepath.Join(dir, "old.stats.json"))
 			base.API = &APIOptions{Socket: filepath.Join(dir, "old.sock")}
 			next := base
 			s := startReloadable(t, base, &next)
-			if e := s.Select("g", "h"); e != nil {
-				t.Fatal(e)
-			}
 			s.reg.Total.AddUp(12345)
 			s.saveStats()
 			oldBytes, _ := os.ReadFile(base.Stats.File)
 			oldInfo, _ := os.Stat(base.Stats.File)
-			oldSel, _ := os.ReadFile(selectStatePath(base.Stats.File))
-			next = selectCfg(filepath.Join(dir, "new.stats.json"), "", "direct", "reject", "h")
+			next = statsCfg(filepath.Join(dir, "new.stats.json"))
 			next.API = &APIOptions{Socket: filepath.Join(dir, "new.sock")}
 			path := next.Stats.File
 			stage := "stats"
@@ -284,9 +281,6 @@ func TestRuntimeAtomicStateFailuresAndContinuation(t *testing.T) {
 				defer os.Chmod(d, 0700)
 				next.Stats.File = filepath.Join(d, "x.stats.json")
 				path = d
-			case "select-directory":
-				path = selectStatePath(path)
-				os.Mkdir(path, 0700)
 			case "parent-file":
 				path = filepath.Join(dir, "parent")
 				os.WriteFile(path, []byte("parent"), 0600)
@@ -327,15 +321,11 @@ func TestRuntimeAtomicStateFailuresAndContinuation(t *testing.T) {
 			}
 			nb, _ := os.ReadFile(base.Stats.File)
 			ni, _ := os.Stat(base.Stats.File)
-			ns, _ := os.ReadFile(selectStatePath(base.Stats.File))
-			if !bytes.Equal(oldBytes, nb) || !os.SameFile(oldInfo, ni) || !bytes.Equal(oldSel, ns) {
+			if !bytes.Equal(oldBytes, nb) || !os.SameFile(oldInfo, ni) {
 				t.Fatal("old files changed on abort")
 			}
 			if s.current().id != 1 || s.persistedPath() != base.Stats.File || s.reg.Snapshot().Total.Up != 12345 {
 				t.Fatal("old runtime changed")
-			}
-			if cur, _ := currentOf(t, s, "g"); cur != "h" {
-				t.Fatal(cur)
 			}
 			if r, e := stats.Lock(base.Stats.File); e == nil {
 				r()
@@ -352,16 +342,15 @@ func TestRuntimeAtomicStateFailuresAndContinuation(t *testing.T) {
 	}
 	// Success overwrites a legal target with this process's total and choices.
 	dir := t.TempDir()
-	base := selectCfg(filepath.Join(dir, "a.stats.json"), "", "direct", "reject", "h")
+	base := statsCfg(filepath.Join(dir, "a.stats.json"))
 	next := base
 	s := startReloadable(t, base, &next)
-	s.Select("g", "h")
 	s.reg.Total.AddUp(77)
-	target := stats.New(nil, nil, nil, nil, time.Now())
+	target := stats.New(nil, nil, nil, time.Now())
 	target.Total.AddUp(999999)
 	newPath := filepath.Join(dir, "b.stats.json")
 	target.Save(newPath, time.Now())
-	next = selectCfg(newPath, "", "direct", "reject", "h")
+	next = statsCfg(newPath)
 	if r, e := s.Reload("switch"); e != nil || r.Generation != 2 {
 		t.Fatal(r, e)
 	}
@@ -373,9 +362,6 @@ func TestRuntimeAtomicStateFailuresAndContinuation(t *testing.T) {
 	json.Unmarshal(b, &disk)
 	if disk.Total.Up != 77 {
 		t.Fatal("wrong saved total", disk.Total)
-	}
-	if cur, _ := currentOf(t, s, "g"); cur != "h" {
-		t.Fatal(cur)
 	}
 	if r, e := stats.Lock(base.Stats.File); e != nil {
 		t.Fatal("old lock not released", e)
@@ -426,16 +412,15 @@ func TestRuntimeAtomicStateFailuresAndContinuation(t *testing.T) {
 
 func TestRuntimeAtomicRenameAbortAndConcurrentSavers(t *testing.T) {
 	dir := t.TempDir()
-	base := selectCfg(filepath.Join(dir, "old.stats.json"), "", "direct", "reject", "h")
+	base := statsCfg(filepath.Join(dir, "old.stats.json"))
 	base.API = &APIOptions{Socket: filepath.Join(dir, "old.sock")}
 	next := base
 	s := startReloadable(t, base, &next)
-	s.Select("g", "h")
 	s.reg.Total.AddUp(7)
 	s.saveStats()
 	old, _ := os.ReadFile(base.Stats.File)
 	oldInfo, _ := os.Stat(base.Stats.File)
-	next = selectCfg(filepath.Join(dir, "new.stats.json"), "", "direct", "reject", "h")
+	next = statsCfg(filepath.Join(dir, "new.stats.json"))
 	next.API = &APIOptions{Socket: filepath.Join(dir, "new.sock")}
 	k := s.core
 	k.reloadMu.Lock()
@@ -452,7 +437,6 @@ func TestRuntimeAtomicRenameAbortAndConcurrentSavers(t *testing.T) {
 		t.Fatal("late filesystem obstacle accepted")
 	}
 	p.abort()
-	g.rt.close()
 	g.dns.close()
 	k.genSeq.Add(^uint64(0))
 	k.reloadMu.Unlock()
@@ -460,33 +444,6 @@ func TestRuntimeAtomicRenameAbortAndConcurrentSavers(t *testing.T) {
 	fi, _ := os.Stat(base.Stats.File)
 	if !bytes.Equal(old, b) || !os.SameFile(fi, oldInfo) {
 		t.Fatal("rename abort changed old")
-	}
-	if _, e = os.Lstat(selectStatePath(next.Stats.File)); !errors.Is(e, os.ErrNotExist) {
-		t.Fatal("installed select not undone")
-	}
-	os.Remove(next.Stats.File)
-	// Repeat with a legal existing select target: undo must restore its inode.
-	selectPath := selectStatePath(next.Stats.File)
-	os.WriteFile(selectPath, []byte("foreign-selection"), 0640)
-	selInfo, _ := os.Stat(selectPath)
-	k.reloadMu.Lock()
-	g, p, e = k.prepare(next, s.current())
-	if e != nil {
-		t.Fatal(e)
-	}
-	os.Mkdir(next.Stats.File, 0700)
-	if e = k.commit(g, p); e == nil {
-		t.Fatal("expected late failure")
-	}
-	p.abort()
-	g.rt.close()
-	g.dns.close()
-	k.genSeq.Add(^uint64(0))
-	k.reloadMu.Unlock()
-	b, _ = os.ReadFile(selectPath)
-	fi, _ = os.Stat(selectPath)
-	if string(b) != "foreign-selection" || !os.SameFile(fi, selInfo) || fi.Mode().Perm() != 0640 {
-		t.Fatal("existing select inode not restored")
 	}
 	os.Remove(next.Stats.File)
 	var wg sync.WaitGroup
@@ -500,15 +457,13 @@ func TestRuntimeAtomicRenameAbortAndConcurrentSavers(t *testing.T) {
 					s.saveStats()
 				case 1:
 					apiBackend{k}.ResetStats()
-				case 2:
-					s.Select("g", []string{"direct", "h"}[i%2])
 				}
 			}
 		}(j)
 	}
 	for i := 0; i < 30; i++ {
 		path := filepath.Join(dir, fmt.Sprintf("cycle-%d.stats.json", i%2))
-		next = selectCfg(path, "", "direct", "reject", "h")
+		next = statsCfg(path)
 		next.API = &APIOptions{Socket: filepath.Join(dir, fmt.Sprintf("cycle-%d.sock", i%2))}
 		if _, e := s.Reload("concurrent"); e != nil {
 			t.Fatal(e)
@@ -528,14 +483,14 @@ func TestRuntimeAtomicRenameAbortAndConcurrentSavers(t *testing.T) {
 
 func TestRuntimeAtomicReversePrepareAbort(t *testing.T) {
 	dir := t.TempDir()
-	base := selectCfg(filepath.Join(dir, "a.stats.json"), "", "direct", "reject", "h")
+	base := statsCfg(filepath.Join(dir, "a.stats.json"))
 	next := base
 	s := startReloadable(t, base, &next)
 	s.reg.Total.AddUp(16)
 	s.saveStats()
 	before, _ := os.ReadFile(base.Stats.File)
 	inode, _ := os.Stat(base.Stats.File)
-	next = selectCfg(filepath.Join(dir, "b.stats.json"), "", "direct", "reject", "h")
+	next = statsCfg(filepath.Join(dir, "b.stats.json"))
 	l, e := net.Listen("tcp4", "127.0.0.1:0")
 	if e != nil {
 		t.Fatal(e)
@@ -545,7 +500,7 @@ func TestRuntimeAtomicReversePrepareAbort(t *testing.T) {
 	// Exercise inverse resource ownership explicitly: state is ready before API
 	// preparation fails. This uses the same production prepare/abort methods.
 	s.reloadMu.Lock()
-	state, e := s.prepareState(&next, s.selections)
+	state, e := s.prepareState(&next)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -564,7 +519,7 @@ func TestRuntimeAtomicReversePrepareAbort(t *testing.T) {
 	} else {
 		r()
 	}
-	for _, path := range []string{next.Stats.File, selectStatePath(next.Stats.File), next.API.Socket} {
+	for _, path := range []string{next.Stats.File, next.API.Socket} {
 		if _, e := os.Lstat(path); !errors.Is(e, os.ErrNotExist) {
 			t.Fatal("candidate leaked", path)
 		}

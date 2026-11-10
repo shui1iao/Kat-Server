@@ -13,10 +13,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/shui1iao/Kat/internal/outbound"
-	"github.com/shui1iao/Kat/internal/outbound/direct"
-	"github.com/shui1iao/Kat/internal/outbound/group"
-	"github.com/shui1iao/Kat/internal/route"
 	"github.com/shui1iao/Kat/internal/stats"
 )
 
@@ -74,115 +70,6 @@ func flowOf(ctx context.Context) *flow {
 	return f
 }
 
-// hops records the members chosen inside groups during one dial / session
-// setup, innermost first.
-type hops struct {
-	mu    sync.Mutex
-	names []string
-}
-
-func (h *hops) add(name string) {
-	h.mu.Lock()
-	h.names = append(h.names, name)
-	h.mu.Unlock()
-}
-
-func (h *hops) chain(head string) []string {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	out := make([]string, 0, len(h.names)+1)
-	out = append(out, head)
-	for i := len(h.names) - 1; i >= 0; i-- {
-		out = append(out, h.names[i])
-	}
-	return out
-}
-
-// Each speculative dial has its own hop list; only the winner commits.
-func withHops(ctx context.Context, h *hops) context.Context {
-	ctx = context.WithValue(ctx, hopsKey{}, h)
-	return group.WithBranchFork(ctx, func(parent context.Context) (context.Context, func()) {
-		target, _ := parent.Value(hopsKey{}).(*hops)
-		branch := &hops{}
-		child := withHops(parent, branch)
-		return child, func() {
-			if target == nil {
-				return
-			}
-			branch.mu.Lock()
-			names := append([]string(nil), branch.names...)
-			branch.mu.Unlock()
-			target.mu.Lock()
-			target.names = append(target.names, names...)
-			target.mu.Unlock()
-		}
-	})
-}
-
-// underlay is the dialer given to a protocol outbound for its own server
-// connection ("via"). It removes the client mark and the hop recorder: that
-// dial is configured by the operator, not chosen by the client.
-type underlay struct{ d outbound.Dialer }
-
-func strip(ctx context.Context) context.Context {
-	if isClient(ctx) || ctx.Value(hopsKey{}) != nil {
-		ctx = context.WithValue(context.WithValue(ctx, clientKey{}, false), hopsKey{}, (*hops)(nil))
-	}
-	return ctx
-}
-func (u underlay) DialTCP(ctx context.Context, dst outbound.Addr) (net.Conn, error) {
-	return dialCarrier(strip(ctx), u.d, dst)
-}
-func (u underlay) ListenPacket(ctx context.Context) (outbound.PacketConn, error) {
-	return u.d.ListenPacket(strip(ctx))
-}
-func (u underlay) UDP() bool { return u.d.UDP() }
-
-// member wraps a group member so that the chosen member is recorded.
-type member struct{ outbound.Outbound }
-
-// Keep nested health visible across the tracking wrapper without treating an
-// ordinary leaf as inherently healthy or changing its own probe record.
-func (m member) ClientGroupHealth() (bool, time.Time, bool) {
-	if g, ok := m.Outbound.(interface{ ClientHealth() (bool, time.Time) }); ok {
-		a, t := g.ClientHealth()
-		return a, t, true
-	}
-	return false, time.Time{}, false
-}
-func (m member) ClientGroupAlive() (bool, bool) {
-	if g, ok := m.Outbound.(interface{ ClientAlive() bool }); ok {
-		return g.ClientAlive(), true
-	}
-	return false, false
-}
-
-func (m member) record(ctx context.Context) {
-	if h, _ := ctx.Value(hopsKey{}).(*hops); h != nil {
-		h.add(m.Name())
-	}
-}
-func (m member) DialTCP(ctx context.Context, dst outbound.Addr) (net.Conn, error) {
-	parent, _ := ctx.Value(carrierChoiceKey{}).(*carrierChoice)
-	c, e := dialCarrier(ctx, m.Outbound, dst)
-	if e == nil {
-		if parent != nil {
-			parent.mu.Lock()
-			parent.name = m.Name()
-			parent.mu.Unlock()
-		}
-		m.record(ctx)
-	}
-	return c, e
-}
-func (m member) ListenPacket(ctx context.Context) (outbound.PacketConn, error) {
-	pc, e := m.Outbound.ListenPacket(ctx)
-	if e == nil {
-		m.record(ctx)
-	}
-	return pc, e
-}
-
 // ---- destination guard ----
 
 var errBlocked = errors.New("destination address not allowed")
@@ -227,7 +114,7 @@ func (s *Server) directDialer() *net.Dialer {
 	return d
 }
 
-func blockedError(e error) bool { return errors.Is(e, errBlocked) || errors.Is(e, direct.ErrBlocked) }
+func blockedError(e error) bool { return errors.Is(e, errBlocked) }
 
 // ---- statistics wiring ----
 
@@ -243,25 +130,16 @@ func inboundKeyName(in Inbound) string { return in.Protocol + "/" + in.Listen }
 
 // ruleKeysOf returns the statistics keys of the normalized routing rules and
 // of final (the default configuration has only "final->direct").
-func ruleKeysOf(c Config) ([]string, string) { return route.RuleKeys(c.route) }
-
 // setupStats makes the statistics keys of this generation visible (names
 // present before keep their totals) and builds its lookup tables.
 func (s *Server) setupStats() {
-	var ins, outs, groups []string
+	var ins []string
 	for _, in := range s.cfg.Inbounds {
 		ins = append(ins, inboundKeyName(in))
 	}
-	outs = append(outs, "direct", "reject")
-	for _, o := range s.cfg.Outbounds {
-		outs = append(outs, o.Name)
-	}
-	for _, g := range s.cfg.Groups {
-		groups = append(groups, g.Name)
-	}
-	ruleKeys, final := ruleKeysOf(s.cfg)
-	all := append([]string{final}, ruleKeys...)
-	s.reg.Rekey(ins, outs, groups, all)
+	outs := []string{"direct"}
+	all := []string{"final->direct"}
+	s.reg.Rekey(ins, outs, all)
 	k := &statKeys{inKeys: ins, ruleKey: all}
 	for _, n := range ins {
 		k.inbound = append(k.inbound, s.reg.Inbound(n))
@@ -283,9 +161,7 @@ func (s *Server) ruleCounter(rule int) (*stats.RuleCounter, string) {
 func (s *Server) chainCounters(chain []string) []*stats.Counter {
 	out := make([]*stats.Counter, 0, len(chain))
 	for _, n := range chain {
-		if c := s.reg.Group(n); c != nil {
-			out = append(out, c)
-		} else if c := s.reg.Outbound(n); c != nil {
+		if c := s.reg.Outbound(n); c != nil {
 			out = append(out, c)
 		}
 	}
@@ -400,17 +276,6 @@ func (f *flow) setSource(ip netip.Addr) {
 	f.mu.Lock()
 	if !f.src.IsValid() {
 		f.src = ip
-	}
-	f.mu.Unlock()
-}
-
-func (f *flow) setResult(r string) {
-	if f == nil {
-		return
-	}
-	f.mu.Lock()
-	if f.result == "" {
-		f.result = r
 	}
 	f.mu.Unlock()
 }

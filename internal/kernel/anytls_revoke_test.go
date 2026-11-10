@@ -326,9 +326,7 @@ func TestAnyTLSCarrierUnrelatedReloads(t *testing.T) {
 		next.Inbounds = append([]Inbound(nil), c0.Inbounds...)
 		if i >= 1 {
 			next.Inbounds[0].Name = "after"
-			next.Inbounds[0].Sniff = &SniffOptions{Enabled: true, TCPPorts: "none", UDPPorts: "none"}
 			next.Log = &LogOptions{Level: "error"}
-			next.Routing = &RoutingOptions{Final: "direct"}
 		}
 		if i >= 2 {
 			o := *in.AnyTLS

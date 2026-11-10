@@ -20,7 +20,6 @@ func (w ss2022ReadActivity) Write(p []byte) (int, error) {
 	w.last.Store(time.Now().UnixNano())
 	return w.Writer.Write(p)
 }
-func (s *Server) copySS2022Up(dst, src net.Conn) error { return s.copySS2022UpM(dst, src, meter{}) }
 
 func (s *Server) copySS2022UpM(dst, src net.Conn, m meter) error {
 	raw := src

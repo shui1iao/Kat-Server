@@ -214,12 +214,6 @@ func peerHeader(proto string, cmd byte, a Address) []byte {
 		b = append(b, cmd)
 		b = append(b, peerAddr(a, false)...)
 		return append(b, 13, 10)
-	case "vless":
-		uuid, _ := hex.DecodeString(strings.ReplaceAll(testUUID, "-", ""))
-		b := append([]byte{0}, uuid...)
-		b = append(b, 0, cmd)
-		b = binary.BigEndian.AppendUint16(b, a.Port)
-		return append(b, peerAddr(a, true)...)
 	}
 	panic(proto)
 }
@@ -260,12 +254,6 @@ func peerResponse(t *testing.T, c net.Conn, p string) Address {
 		}
 		return a
 	}
-	if p == "vless" {
-		b, e := readN(c, 2)
-		if e != nil || !bytes.Equal(b, []byte{0, 0}) {
-			t.Fatalf("VLESS response %x %v", b, e)
-		}
-	}
 	return Address{}
 }
 func inFor(p string, tlsCfg *TLSConfig) Inbound {
@@ -273,8 +261,6 @@ func inFor(p string, tlsCfg *TLSConfig) Inbound {
 	switch p {
 	case "trojan":
 		in.Users = []User{{Password: "test-password"}}
-	case "vless":
-		in.Users = []User{{UUID: testUUID}}
 	}
 	return in
 }
@@ -285,7 +271,7 @@ func TestTCPProtocols(t *testing.T) {
 		tls  bool
 		auth bool
 		fast bool
-	}{{"socks5", false, false, true}, {"socks5", false, true, false}, {"trojan", true, false, false}, {"vless", false, false, true}, {"vless", true, false, false}} {
+	}{{"socks5", false, false, true}, {"socks5", false, true, false}, {"trojan", true, false, false}} {
 		t.Run(fmt.Sprintf("%s-tls%v-auth%v", tc.p, tc.tls, tc.auth), func(t *testing.T) {
 			var tlsCfg *TLSConfig
 			var roots *x509.CertPool
@@ -329,7 +315,7 @@ func TestTCPProtocols(t *testing.T) {
 }
 func TestServerFirstAndHalfClose(t *testing.T) {
 	cert, pool := testCert(t)
-	for _, p := range []string{"socks5", "trojan", "vless"} {
+	for _, p := range []string{"socks5", "trojan"} {
 		t.Run(p, func(t *testing.T) {
 			var cfg *TLSConfig
 			var roots *x509.CertPool
@@ -404,7 +390,7 @@ func TestStreamUDP(t *testing.T) {
 	for _, tc := range []struct {
 		p   string
 		tls bool
-	}{{"trojan", true}, {"vless", false}, {"vless", true}} {
+	}{{"trojan", true}} {
 		t.Run(fmt.Sprintf("%s-tls%v", tc.p, tc.tls), func(t *testing.T) {
 			var cfg *TLSConfig
 			var roots *x509.CertPool
@@ -561,7 +547,7 @@ func TestUDPUnsolicitedSource(t *testing.T) {
 func TestTLSAndCredentialsRejected(t *testing.T) {
 	cert, pool := testCert(t)
 	target := echoTCP(t)
-	for _, p := range []string{"trojan", "vless"} {
+	for _, p := range []string{"trojan"} {
 		t.Run(p, func(t *testing.T) {
 			s := startTest(t, inFor(p, cert), nil)
 			for _, cfg := range []*tls.Config{{RootCAs: x509.NewCertPool(), ServerName: "localhost"}, {RootCAs: pool, ServerName: "wrong.invalid"}} {
@@ -586,7 +572,7 @@ func TestTLSAndCredentialsRejected(t *testing.T) {
 func TestMalformedRequests(t *testing.T) {
 	cert, pool := testCert(t)
 	target := Address{"127.0.0.1", 9}
-	for _, p := range []string{"trojan", "vless"} {
+	for _, p := range []string{"trojan"} {
 		var cfg *TLSConfig
 		var roots *x509.CertPool
 		if p == "trojan" {
@@ -631,16 +617,6 @@ func TestMalformedRequests(t *testing.T) {
 				}
 				c.Close()
 			})
-		}
-	}
-	for _, b := range [][]byte{{0}, {10, 2, 1}, {8, 1}, {10, 1, 120}, {18, 1, 1}, {0x80}} {
-		if validateAddons(b) == nil {
-			t.Errorf("accepted addons %x", b)
-		}
-	}
-	for _, b := range [][]byte{nil, {10, 0}, {24, 1}, {29, 0, 0, 0, 0}, {34, 2, 1, 2}} {
-		if e := validateAddons(b); e != nil {
-			t.Errorf("valid unknown/empty addons %x: %v", b, e)
 		}
 	}
 }
@@ -734,10 +710,11 @@ func TestIPv6(t *testing.T) {
 	}
 	probe.Close()
 	target := sinkTCP(t, "tcp6", "[::1]:0", func(c net.Conn) { io.Copy(c, c) })
-	s := startTest(t, Inbound{Protocol: "vless", Listen: "[::1]:0", Users: []User{{UUID: testUUID}}}, nil)
+	s := startTest(t, Inbound{Protocol: "socks5", Listen: "[::1]:0"}, nil)
 	c := dialPeer(t, s, nil)
-	writeAll(c, append(peerHeader("vless", 1, target), []byte("ipv6")...))
-	peerResponse(t, c, "vless")
+	socksGreeting(t, c, false, "")
+	writeAll(c, append(peerHeader("socks5", 1, target), []byte("ipv6")...))
+	peerResponse(t, c, "socks5")
 	b, e := readN(c, 4)
 	if e != nil || string(b) != "ipv6" {
 		t.Fatal("IPv6 failed", e)
@@ -751,7 +728,7 @@ func TestAddressWireAndConfig(t *testing.T) {
 			t.Fatalf("address %v %v", got, e)
 		}
 	}
-	cases := []Config{{Inbounds: []Inbound{{Protocol: "socks5", Listen: "0.0.0.0:1080"}}}, {Inbounds: []Inbound{{Protocol: "vless", Listen: "0.0.0.0:1080", Users: []User{{UUID: testUUID}}}}}, {Inbounds: []Inbound{{Protocol: "trojan", Listen: "127.0.0.1:0", Users: []User{{Password: "secret"}}}}}, {Inbounds: []Inbound{{Protocol: "vless", Listen: "127.0.0.1:0", Users: []User{{UUID: "bad"}}}}}}
+	cases := []Config{{Inbounds: []Inbound{{Protocol: "socks5", Listen: "0.0.0.0:1080"}}}, {Inbounds: []Inbound{{Protocol: "trojan", Listen: "127.0.0.1:0", Users: []User{{Password: "secret"}}}}}}
 	for _, c := range cases {
 		if c.Validate() == nil {
 			t.Fatal("unsafe config accepted")

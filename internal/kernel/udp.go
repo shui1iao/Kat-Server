@@ -34,18 +34,11 @@ type udpAssociation struct {
 	client                       netip.AddrPort
 	allowed                      map[netip.AddrPort]time.Time
 	wg                           sync.WaitGroup
-	// Routing: client address (src_ip_cidr only, never logged) and the lazily
-	// created per-outbound proxy sessions (guarded by mu).
-	source      netip.Addr
-	proxies     map[string]*proxySession
-	proxyClosed bool
+	source                       netip.Addr
 	// Statistics: the association's flow and the route of each direct
 	// target (same lifetime as allowed, guarded by mu) for reply metering.
 	flow   *flow
 	routes map[netip.AddrPort]*udpRoute
-	// Sniffing (0.7.0): with override_destination a direct reply from the
-	// resolved address is reported from the client's original target.
-	reverse map[netip.AddrPort]Address
 }
 
 func (s *Server) resolve(ctx context.Context, a Address) (netip.AddrPort, error) {
@@ -128,9 +121,6 @@ func (s *Server) serveUDP(c net.Conn, r request) error {
 			return e
 		}
 		defer a.native.Close()
-	}
-	if r.Mode == "vless" && r.Target.Port == 0 {
-		return errors.New("zero UDP destination")
 	}
 	var bound net.Addr
 	if a.native != nil {
@@ -291,46 +281,23 @@ func (a *udpAssociation) streamLoop() error {
 }
 func (a *udpAssociation) sendLoop() {
 	idle := a.server.cfg.Limits.UDPIdle.value()
-	// Proxy sessions never outlive the association's sender.
-	defer a.closeProxies()
-	sn := a.newUDPSniffer()
 	for {
 		select {
 		case <-a.ctx.Done():
 			return
-		case <-sn.timerC():
-			sn.expire(a, time.Now(), idle)
 		case p := <-a.queue:
 			a.queuedBytes.Add(-int64(len(p.payload)))
-			if sn != nil {
-				sn.packet(a, p, idle)
-				continue
-			}
 			a.send(a.ctx, p, idle)
 		}
 	}
 }
 
-// send routes and forwards one datagram (ctx may carry a sniff result).
+// send resolves and forwards one datagram directly.
 func (a *udpAssociation) send(ctx context.Context, p packet, idle time.Duration) {
-	candidates, proxy, host, rule, e := a.server.routeUDP(ctx, p.target, a.source)
+	candidates, e := a.server.routeUDP(ctx, p.target)
 	if e != nil {
-		if errors.Is(e, errRouteReject) {
-			a.flow.udpDecided(p.target, rule, []string{"reject"})
-		}
 		a.server.counters.Dropped.Add(1)
 		a.server.resolutionFailure(e)
-		return
-	}
-	overridden := sniffOf(ctx).target(p.target) != p.target
-	if proxy != "" {
-		dst := Address{host, p.target.Port}
-		if overridden {
-			// Replies through a proxy cannot be mapped back reliably:
-			// the outbound gets the original target.
-			dst = p.target
-		}
-		a.sendProxy(proxy, dst, p.payload, p.target, rule)
 		return
 	}
 	var target netip.AddrPort
@@ -359,14 +326,13 @@ func (a *udpAssociation) send(ctx context.Context, p packet, idle time.Duration)
 		}
 		return
 	}
-	rt := a.flow.udpDecided(p.target, rule, []string{"direct"})
+	rt := a.flow.udpDecided(p.target, 0, []string{"direct"})
 	now := time.Now()
 	a.mu.Lock()
 	for k, t := range a.allowed {
 		if now.Sub(t) > idle {
 			delete(a.allowed, k)
 			delete(a.routes, k)
-			delete(a.reverse, k)
 		}
 	}
 	_, exists := a.allowed[target]
@@ -377,12 +343,6 @@ func (a *udpAssociation) send(ctx context.Context, p packet, idle time.Duration)
 		return
 	}
 	a.allowed[target] = now
-	if overridden {
-		if a.reverse == nil {
-			a.reverse = map[netip.AddrPort]Address{}
-		}
-		a.reverse[target] = p.target
-	}
 	if rt != nil {
 		if a.routes == nil {
 			a.routes = map[netip.AddrPort]*udpRoute{}
@@ -425,11 +385,6 @@ func (a *udpAssociation) returnLoop(socket *net.UDPConn) {
 		}
 		payload := b[:n]
 		source := Address{src.Addr().String(), src.Port()}
-		a.mu.Lock()
-		if o, ok := a.reverse[src]; ok {
-			source = o
-		}
-		a.mu.Unlock()
 		if e = a.output(client, source, payload, idle); e != nil {
 			return
 		}

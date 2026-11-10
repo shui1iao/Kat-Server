@@ -87,10 +87,33 @@ func BenchmarkUDP2017KDF(b *testing.B) {
 	}
 }
 
-func BenchmarkUDP2017ResponseBuffers(b *testing.B){
- s,_:=NewServer(Config{Method:AES128GCM,Key:seq(0,16)});salt:=seq(33,16);a,_:=s.aead(salt);payload:=make([]byte,1200);var nonce [12]byte
- for _,kind:=range []string{"old-three-buffers","one-wire"}{b.Run(kind,func(b *testing.B){b.ReportAllocs();var wire []byte
- for i:=0;i<b.N;i++{address,_:=testTarget.MarshalBinary();if kind=="old-three-buffers"{body:=append(address,payload...);wire=append(salt[:len(salt):len(salt)],a.Seal(nil,nonce[:],body,nil)...)}else{start:=len(salt);wire=make([]byte,start+len(address)+len(payload)+a.Overhead());copy(wire,salt);copy(wire[start:],address);copy(wire[start+len(address):],payload);wire=a.Seal(wire[:start],nonce[:],wire[start:len(wire)-a.Overhead()],nil)}}
- if len(wire)==0{b.Fatal("missing wire")}
- })}
+func BenchmarkUDP2017ResponseBuffers(b *testing.B) {
+	s, _ := NewServer(Config{Method: AES128GCM, Key: seq(0, 16)})
+	salt := seq(33, 16)
+	a, _ := s.aead(salt)
+	payload := make([]byte, 1200)
+	var nonce [12]byte
+	for _, kind := range []string{"old-three-buffers", "one-wire"} {
+		b.Run(kind, func(b *testing.B) {
+			b.ReportAllocs()
+			var wire []byte
+			for i := 0; i < b.N; i++ {
+				address, _ := testTarget.MarshalBinary()
+				if kind == "old-three-buffers" {
+					body := append(address, payload...)
+					wire = append(salt[:len(salt):len(salt)], a.Seal(nil, nonce[:], body, nil)...)
+				} else {
+					start := len(salt)
+					wire = make([]byte, start+len(address)+len(payload)+a.Overhead())
+					copy(wire, salt)
+					copy(wire[start:], address)
+					copy(wire[start+len(address):], payload)
+					wire = a.Seal(wire[:start], nonce[:], wire[start:len(wire)-a.Overhead()], nil)
+				}
+			}
+			if len(wire) == 0 {
+				b.Fatal("missing wire")
+			}
+		})
+	}
 }

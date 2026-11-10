@@ -8,7 +8,6 @@ import (
 	"net/netip"
 	"sort"
 	"strconv"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -40,7 +39,6 @@ type tcpEntry struct {
 	key    string
 	ln     net.Listener
 	bind   atomic.Pointer[binding]
-	xh     atomic.Pointer[xhttpRunner] // set while the bound inbound uses XHTTP
 	closed atomic.Bool
 	done   chan struct{}
 	tfo    bool // TCP_FASTOPEN set on ln (reloadMu)
@@ -60,17 +58,33 @@ func ephemeralPort(key string) bool {
 	return e == nil && port == "0"
 }
 
+// listenerSlot is the reload identity of inbound i of inbounds: its listen
+// key, with port 0 listeners numbered per address as reload numbers them.
+func listenerSlot(inbounds []Inbound, i int) string {
+	key := listenKey(inbounds[i].Listen)
+	if !ephemeralPort(key) {
+		return key
+	}
+	n := 0
+	for j := 0; j < i; j++ {
+		if listenKey(inbounds[j].Listen) == key {
+			n++
+		}
+	}
+	return key + "#" + strconv.Itoa(n)
+}
+
 // refEntry returns the generation bound to e with one reference taken, or
 // nil when e no longer accepts.
-func (k *core) refEntry(e *tcpEntry) (*Server, int, *xhttpRunner) {
+func (k *core) refEntry(e *tcpEntry) (*Server, int) {
 	k.bindMu.RLock()
 	defer k.bindMu.RUnlock()
 	if e.closed.Load() {
-		return nil, 0, nil
+		return nil, 0
 	}
 	b := e.bind.Load()
 	b.g.refs.Add(1) // current generation: refs >= 1 while bindMu is held
-	return b.g, b.idx, e.xh.Load()
+	return b.g, b.idx
 }
 
 // tryRef takes a reference unless the generation is already released.
@@ -110,7 +124,6 @@ func (s *Server) supersede() {
 }
 
 func (s *Server) release() {
-	s.rt.close()
 	s.dns.close()
 	s.gensMu.Lock()
 	delete(s.gens, s.id)
@@ -153,16 +166,13 @@ func (e *prepareError) Unwrap() error { return e.err }
 
 // plan holds what prepare created and commit installs (or abort undoes).
 type plan struct {
-	keys    []string
-	newTCP  map[string]net.Listener
-	newUDP  map[string]*ssUDPListener
-	logger  *logger // non-nil: replace the log sink
-	created []*xhttpRunner
-	sel     map[string]selRecord
-	selLog  []string
-	tls     tlsPlan
-	api     *api.Prepared
-	state   *statePlan
+	keys   []string
+	newTCP map[string]net.Listener
+	newUDP map[string]*ssUDPListener
+	logger *logger // non-nil: replace the log sink
+	tls    tlsPlan
+	api    *api.Prepared
+	state  *statePlan
 }
 
 func (p *plan) abort() {
@@ -202,7 +212,6 @@ func (k *core) prepareContext(ctx context.Context, c Config, prev *Server) (*Ser
 	p := &plan{newTCP: map[string]net.Listener{}, newUDP: map[string]*ssUDPListener{}}
 	fail := func(stage string, e error) (*Server, *plan, error) {
 		p.abort()
-		g.rt.close()
 		g.dns.close()
 		return nil, nil, &prepareError{stage, e}
 	}
@@ -214,25 +223,10 @@ func (k *core) prepareContext(ctx context.Context, c Config, prev *Server) (*Ser
 		return fail("dns", e)
 	}
 	g.dns = dns
-	rt, e := g.buildRouting()
-	if e != nil {
-		return fail("routing", e)
-	}
-	g.rt = rt
-	if prev != nil {
-		g.inheritGroupLearning(prev)
-	}
 	if e := ctx.Err(); e != nil {
 		return fail("canceled", e)
 	}
-	p.sel, p.selLog = k.applySelections(g)
 	if e := g.prepareAnyTLS(prev); e != nil {
-		return fail("inbound", e)
-	}
-	if e := g.prepareXHTTP(prev); e != nil {
-		return fail("inbound", e)
-	}
-	if e := g.prepareVLESS(prev); e != nil {
 		return fail("inbound", e)
 	}
 	if e := g.prepareEncrypted(prev); e != nil {
@@ -283,7 +277,6 @@ func (k *core) prepareContext(ctx context.Context, c Config, prev *Server) (*Ser
 					var rb *ssRcvBufError
 					if errors.As(err, &rb) {
 						p.abort()
-						g.rt.close()
 						g.dns.close()
 						return nil, nil, err
 					}
@@ -306,7 +299,7 @@ func (k *core) prepareContext(ctx context.Context, c Config, prev *Server) (*Ser
 		if e != nil {
 			return fail("api", e)
 		}
-		p.state, e = k.prepareState(&c, p.sel)
+		p.state, e = k.prepareState(&c)
 		if e != nil {
 			return fail("stats", e)
 		}
@@ -349,7 +342,6 @@ func (k *core) commitContext(ctx context.Context, g *Server, p *plan) error {
 	var udpStarts []*ssUDPListener
 	var drains []*ssUDPListener
 	var removed []*tcpEntry
-	var retire []*xhttpRunner
 	udpUsed := map[string]bool{}
 	k.bindMu.Lock()
 	used := map[string]bool{}
@@ -364,23 +356,6 @@ func (k *core) commitContext(ctx context.Context, g *Server, p *plan) error {
 			starts = append(starts, e)
 		}
 		e.bind.Store(&binding{g, i})
-		old := e.xh.Load()
-		if in.xhttpServer != nil {
-			if old != nil && old.codec == in.xhttpServer {
-				old.bind.Store(&binding{g, i})
-			} else {
-				r := newXHTTPRunner(in.xhttpServer)
-				r.bind.Store(&binding{g, i})
-				e.xh.Store(r)
-				p.created = append(p.created, r)
-				if old != nil {
-					retire = append(retire, old)
-				}
-			}
-		} else if old != nil {
-			e.xh.Store(nil)
-			retire = append(retire, old)
-		}
 		g.listeners = append(g.listeners, e.ln)
 		if in.ssRuntime != nil {
 			udpUsed[key] = true
@@ -402,9 +377,6 @@ func (k *core) commitContext(ctx context.Context, g *Server, p *plan) error {
 			e.closed.Store(true)
 			delete(k.tcpEntries, key)
 			removed = append(removed, e)
-			if r := e.xh.Swap(nil); r != nil {
-				retire = append(retire, r)
-			}
 		}
 	}
 	k.udpMu.Lock()
@@ -417,28 +389,9 @@ func (k *core) commitContext(ctx context.Context, g *Server, p *plan) error {
 	k.udpMu.Unlock()
 	k.gen.Store(g)
 	k.bindMu.Unlock()
-	k.selMu.Lock()
-	k.selections = p.sel
-	k.selMu.Unlock()
-	if len(p.selLog) > 0 {
-		for _, line := range p.selLog {
-			k.notice(levelInfo, line)
-		}
-		if p.state == nil {
-			k.saveSelections()
-		}
-	}
 
 	for _, e := range removed {
 		e.ln.Close()
-	}
-	for _, r := range p.created {
-		k.runners[r] = true
-		k.accepts.Add(1)
-		go k.runXHTTP(r)
-	}
-	for _, r := range retire {
-		k.retireRunner(r)
 	}
 	for _, e := range starts {
 		k.accepts.Add(1)
@@ -464,7 +417,6 @@ func (k *core) commitContext(ctx context.Context, g *Server, p *plan) error {
 	k.gens[g.id] = g
 	k.gensMu.Unlock()
 	k.liveGens.Add(1)
-	g.rt.start(ctx)
 	if prev != nil {
 		prev.supersede()
 	}
@@ -553,45 +505,12 @@ func (s *Server) reloadCandidateContext(ctx context.Context, trigger string, rer
 	k := s.core
 	k.reloadMu.Lock()
 	defer k.reloadMu.Unlock()
-	return s.reloadCandidateLockedContext(ctx, trigger, reread, candidate, nil)
+	return s.reloadCandidateLockedContext(ctx, trigger, reread, candidate)
 }
-func (s *Server) reloadProvider(ctx context.Context, q *providerCandidate) (ReloadResult, error) {
-	k := s.core
-	k.reloadMu.Lock()
-	defer k.reloadMu.Unlock()
-	if ctx.Err() != nil {
-		return ReloadResult{}, ctx.Err()
-	}
-	k.provMu.Lock()
-	active := k.providers[q.p.cfg.Name]
-	k.provMu.Unlock()
-	if active != q.p || active.key != q.p.key {
-		return ReloadResult{}, errors.New("provider_stale")
-	}
-	k.mu.Lock()
-	closing := k.closing
-	k.mu.Unlock()
-	if closing {
-		return ReloadResult{}, errors.New("provider_stopped")
-	}
-	q.ctx = ctx
-	q.p.mu.Lock()
-	same := q.p.loaded && q.p.hash == q.hash
-	q.p.mu.Unlock()
-	if same {
-		q.accept()
-		return ReloadResult{OK: true, Generation: k.gen.Load().id}, nil
-	}
-	return s.reloadCandidateLocked("provider", false, nil, q)
+func (s *Server) reloadCandidateLocked(trigger string, reread bool, candidate *Config) (ReloadResult, error) {
+	return s.reloadCandidateLockedContext(context.Background(), trigger, reread, candidate)
 }
-func (s *Server) reloadCandidateLocked(trigger string, reread bool, candidate *Config, q *providerCandidate) (ReloadResult, error) {
-	ctx := context.Background()
-	if q != nil && q.ctx != nil {
-		ctx = q.ctx
-	}
-	return s.reloadCandidateLockedContext(ctx, trigger, reread, candidate, q)
-}
-func (s *Server) reloadCandidateLockedContext(ctx context.Context, trigger string, reread bool, candidate *Config, q *providerCandidate) (ReloadResult, error) {
+func (s *Server) reloadCandidateLockedContext(ctx context.Context, trigger string, reread bool, candidate *Config) (ReloadResult, error) {
 	if e := ctx.Err(); e != nil {
 		return ReloadResult{}, e
 	}
@@ -599,15 +518,13 @@ func (s *Server) reloadCandidateLockedContext(ctx context.Context, trigger strin
 	start := time.Now()
 	res := ReloadResult{At: start, Trigger: trigger}
 	failWith := func(stage string, e error) (ReloadResult, error) {
-		if q != nil {
-			e = errors.New("provider_candidate_failed")
-		}
 		res.Stage, res.Error, res.DurationMS = stage, e.Error(), time.Since(start).Milliseconds()
 		k.reloadFailures.Add(1)
 		k.lastReload.Store(&res)
 		s.notice(levelWarn, "kat event=reload_failed trigger="+eventToken(trigger, 16)+" stage="+stage+" reason="+eventToken(e.Error(), 300))
 		return res, &ReloadError{stage, e}
 	}
+
 	k.mu.Lock()
 	closing := k.closing
 	k.mu.Unlock()
@@ -648,24 +565,12 @@ func (s *Server) reloadCandidateLockedContext(ctx context.Context, trigger strin
 	if e = c.Validate(); e != nil {
 		return failWith("validate", e)
 	}
-	prov := k.syncProviders(&c, reread)
-	if prov.err != nil {
-		return failWith("provider", prov.err)
-	}
-	notes, err := expandProviderCandidate(&c, prov.next, q)
-	if err != nil {
-		return failWith("provider", err)
-	}
-	prov.notes = append(prov.notes, notes...)
-	if e = c.Validate(); e != nil {
-		return failWith("validate", e)
-	}
+
 	g, p, e := k.prepareContext(ctx, c, prev)
 	if e == nil {
 		e = k.commitContext(ctx, g, p)
 		if e != nil {
 			p.abort()
-			g.rt.close()
 			g.dns.close()
 		}
 	}
@@ -682,10 +587,6 @@ func (s *Server) reloadCandidateLockedContext(ctx context.Context, trigger strin
 		}
 		return failWith(stage, e)
 	}
-	if q != nil {
-		q.accept()
-	}
-	k.installProviders(prov)
 	res.OK, res.Generation, res.DurationMS = true, g.id, time.Since(start).Milliseconds()
 	k.reloads.Add(1)
 	k.lastReload.Store(&res)
@@ -751,58 +652,4 @@ func (k *core) closeIfDrained(u *ssUDPListener) {
 		return
 	}
 	k.udpMu.Unlock()
-}
-
-// ---- XHTTP across generations ----
-
-// xhttpRunner is one running XHTTP server fed with TLS connections by the
-// accept loop of its socket. An unchanged XHTTP configuration keeps its
-// runner (and its HTTP sessions) across reloads; a replaced runner keeps
-// serving its open HTTP connections and stops when they are gone.
-type xhttpRunner struct {
-	codec  xhttpCodec
-	ready  chan net.Conn
-	closed chan struct{}
-	once   sync.Once
-	bind   atomic.Pointer[binding]
-}
-
-func newXHTTPRunner(codec xhttpCodec) *xhttpRunner {
-	return &xhttpRunner{codec: codec, ready: make(chan net.Conn), closed: make(chan struct{})}
-}
-
-func (r *xhttpRunner) close() { r.once.Do(func() { close(r.closed) }) }
-
-// ref returns the generation of r with one reference taken.
-func (k *core) refRunner(r *xhttpRunner) (*Server, int) {
-	k.bindMu.RLock()
-	defer k.bindMu.RUnlock()
-	b := r.bind.Load()
-	if !b.g.tryRef() {
-		return nil, 0
-	}
-	return b.g, b.idx
-}
-
-func (k *core) retireRunner(r *xhttpRunner) {
-	go func() {
-		t := time.NewTicker(2 * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-r.closed:
-				return
-			case <-k.ctx.Done():
-				return
-			case <-t.C:
-				if r.codec.Stats().Connections == 0 {
-					k.reloadMu.Lock()
-					delete(k.runners, r)
-					k.reloadMu.Unlock()
-					r.close()
-					return
-				}
-			}
-		}
-	}()
 }

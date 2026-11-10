@@ -13,7 +13,6 @@ type datagramCodec interface {
 	AppendPacket([]byte, Address, []byte) []byte
 }
 type trojanDatagrams struct{}
-type vlessDatagrams struct{}
 
 func readDatagramBody(r io.Reader, crlf bool) ([]byte, error) {
 	b, e := readN(r, 2)
@@ -43,13 +42,5 @@ func (trojanDatagrams) AppendPacket(b []byte, a Address, p []byte) []byte {
 	b = appendAddress(b, a, false)
 	b = binary.BigEndian.AppendUint16(b, uint16(len(p)))
 	b = append(b, 13, 10)
-	return append(b, p...)
-}
-func (vlessDatagrams) ReadPacket(r io.Reader, a Address) (packet, error) {
-	b, e := readDatagramBody(r, false)
-	return packet{a, b}, e
-}
-func (vlessDatagrams) AppendPacket(b []byte, _ Address, p []byte) []byte {
-	b = binary.BigEndian.AppendUint16(b, uint16(len(p)))
 	return append(b, p...)
 }

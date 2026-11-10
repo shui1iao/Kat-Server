@@ -14,42 +14,19 @@ import (
 func TestUDPBadFramesAndLengths(t *testing.T) {
 	cert, pool := testCert(t)
 	target, _ := echoUDP(t)
-	for _, p := range []string{"trojan", "vless"} {
-		var cfg *TLSConfig
-		if p == "trojan" {
-			cfg = cert
-		}
-		s := startTest(t, inFor(p, cfg), nil)
+	for _, p := range []string{"trojan"} {
+		s := startTest(t, inFor(p, cert), nil)
 		for _, bad := range []string{"oversize", "truncated", "badcrlf"} {
-			if bad == "badcrlf" && p != "trojan" {
-				continue
-			}
 			t.Run(p+"-"+bad, func(t *testing.T) {
-				var c net.Conn
-				if p == "trojan" {
-					c = dialPeer(t, s, pool)
-				} else {
-					c = dialPeer(t, s, nil)
-				}
-				cmd := byte(2)
-				if p == "trojan" {
-					cmd = 3
-				}
-				writeAll(c, peerHeader(p, cmd, target))
+				c := dialPeer(t, s, pool)
+				writeAll(c, peerHeader(p, 3, target))
 				peerResponse(t, c, p)
-				var frame []byte
-				if p == "trojan" {
-					frame = peerAddr(target, false)
-				}
+				frame := peerAddr(target, false)
 				switch bad {
 				case "oversize":
 					frame = append(frame, 255, 255)
 				case "truncated":
-					frame = append(frame, 0, 9)
-					if p == "trojan" {
-						frame = append(frame, 13, 10)
-					}
-					frame = append(frame, 1, 2)
+					frame = append(frame, 0, 9, 13, 10, 1, 2)
 				case "badcrlf":
 					frame = append(frame, 0, 1, 0, 10, 1)
 				}
@@ -66,21 +43,22 @@ func TestUDPBadFramesAndLengths(t *testing.T) {
 	}
 }
 func TestLargeDatagramAndCombinedFrames(t *testing.T) {
-	s := startTest(t, inFor("vless", nil), nil)
+	cert, pool := testCert(t)
+	s := startTest(t, inFor("trojan", cert), nil)
 	target, _ := echoUDP(t)
-	c := dialPeer(t, s, nil)
-	writeAll(c, peerHeader("vless", 2, target))
-	peerResponse(t, c, "vless")
+	c := dialPeer(t, s, pool)
+	writeAll(c, peerHeader("trojan", 3, target))
+	peerResponse(t, c, "trojan")
 	want := bytes.Repeat([]byte{0x42}, maxDatagram)
-	frame := peerUDPFrame("vless", target, want)
+	frame := peerUDPFrame("trojan", target, want)
 	writeAll(c, frame)
-	if got := peerUDPRead(t, c, "vless"); !bytes.Equal(got, want) {
+	if got := peerUDPRead(t, c, "trojan"); !bytes.Equal(got, want) {
 		t.Fatal("large UDP corrupted")
 	}
-	b := append(peerUDPFrame("vless", target, []byte("merged1")), peerUDPFrame("vless", target, []byte("merged2"))...)
+	b := append(peerUDPFrame("trojan", target, []byte("merged1")), peerUDPFrame("trojan", target, []byte("merged2"))...)
 	writeAll(c, b)
 	for _, want := range []string{"merged1", "merged2"} {
-		if string(peerUDPRead(t, c, "vless")) != want {
+		if string(peerUDPRead(t, c, "trojan")) != want {
 			t.Fatal("coalesced frames corrupted")
 		}
 	}
@@ -170,25 +148,14 @@ func TestFailedAuthenticationNeverDials(t *testing.T) {
 	cert, pool := testCert(t)
 	var accepted atomic.Int64
 	target := sinkTCP(t, "tcp4", "127.0.0.1:0", func(c net.Conn) { accepted.Add(1) })
-	for _, p := range []string{"trojan", "vless"} {
-		var cfg *TLSConfig
-		if p == "trojan" {
-			cfg = cert
-		}
-		s := startTest(t, inFor(p, cfg), nil)
-		var c net.Conn
-		if p == "trojan" {
-			c = dialPeer(t, s, pool)
-		} else {
-			c = dialPeer(t, s, nil)
-		}
-		h := peerHeader(p, 1, target)
-		h[1] ^= 1
-		writeAll(c, append(h, []byte("secret")...))
-		io.ReadAll(c)
-		c.Close()
-		waitFor(t, func() bool { return s.Stats().Active == 0 })
-	}
+	s := startTest(t, inFor("trojan", cert), nil)
+	c := dialPeer(t, s, pool)
+	h := peerHeader("trojan", 1, target)
+	h[1] ^= 1
+	writeAll(c, append(h, []byte("secret")...))
+	io.ReadAll(c)
+	c.Close()
+	waitFor(t, func() bool { return s.Stats().Active == 0 })
 	if accepted.Load() != 0 {
 		t.Fatal("unauthenticated dial occurred")
 	}
@@ -211,29 +178,7 @@ func TestTLSVersions(t *testing.T) {
 		}
 	}
 }
-func TestVLESSUnknownAddonAccepted(t *testing.T) {
-	s := startTest(t, inFor("vless", nil), nil)
-	target := echoTCP(t)
-	c := dialPeer(t, s, nil)
-	h := peerHeader("vless", 1, target)
-	prefix := append([]byte(nil), h[:17]...)
-	prefix = append(prefix, 2, 24, 1)
-	prefix = append(prefix, h[18:]...)
-	writeAll(c, append(prefix, []byte("addon")...))
-	peerResponse(t, c, "vless")
-	b, e := readN(c, 5)
-	if e != nil || string(b) != "addon" {
-		t.Fatal("valid unknown addons failed")
-	}
-}
 func TestDatagramTypeEnumerations(t *testing.T) {
-	for _, a := range []Address{{"127.0.0.1", 53}, {"::1", 443}, {"localhost", 80}} {
-		b := peerAddr(a, true)
-		h, e := readHost(bytes.NewReader(b), true)
-		if e != nil || h.Host != a.Host {
-			t.Fatal("VLESS address enum", h, e)
-		}
-	}
 	for _, raw := range [][]byte{{2}, {1, 127}, {3, 0}, {4, 1, 2}} {
 		if _, e := readAddress(bytes.NewReader(raw), false); e == nil {
 			t.Fatal("bad address accepted")

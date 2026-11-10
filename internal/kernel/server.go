@@ -5,8 +5,6 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
-	"github.com/shui1iao/Kat/internal/outbound"
-	"github.com/shui1iao/Kat/internal/route"
 	"github.com/shui1iao/Kat/internal/ss"
 	"github.com/shui1iao/Kat/internal/stats"
 	"github.com/shui1iao/Kat/internal/tlscert"
@@ -17,45 +15,26 @@ import (
 	"time"
 )
 
-type TestDiagnostics struct {
-	VisionReadDirect  int64 `json:"vision_read_direct"`
-	VisionWriteDirect int64 `json:"vision_write_direct"`
-	HTTPEarlyData     int64 `json:"http_early_data"`
-	XHTTPH1           int64 `json:"xhttp_h1"`
-	XHTTPH2           int64 `json:"xhttp_h2"`
-	XHTTPPacket       int64 `json:"xhttp_packet_up"`
-	XHTTPStreamUp     int64 `json:"xhttp_stream_up"`
-	XHTTPStreamOne    int64 `json:"xhttp_stream_one"`
-}
-
-func (s *Server) Diagnostics() TestDiagnostics {
-	return TestDiagnostics{VisionReadDirect: s.visionRead.Load(), VisionWriteDirect: s.visionWrite.Load(), HTTPEarlyData: s.httpEarly.Load(), XHTTPH1: s.xhttpH1.Load(), XHTTPH2: s.xhttpH2.Load(), XHTTPPacket: s.xhttpPacket.Load(), XHTTPStreamUp: s.xhttpStreamUp.Load(), XHTTPStreamOne: s.xhttpStreamOne.Load()}
-}
-
 type acceptedState struct{ ss, hand bool }
 
 // core is the process-wide state shared by every configuration generation:
 // budgets, connection registry, logging, statistics, management API and the
 // inbound listening sockets. A reload replaces the generation, never the core.
 type core struct {
-	failures                                                     *failureLog
-	events                                                       *eventLog
-	xhttpH1, xhttpH2, xhttpPacket, xhttpStreamUp, xhttpStreamOne atomic.Int64
-	httpEarly                                                    atomic.Int64
-	logicalSlots                                                 *slots
-	logical                                                      atomic.Int64
-	ctx                                                          context.Context
-	cancel                                                       context.CancelFunc
-	nativeCancel                                                 context.CancelFunc
-	nativeContext                                                context.Context
-	mu                                                           sync.Mutex
-	active                                                       map[net.Conn]*acceptedState
-	closing                                                      bool
-	wg                                                           sync.WaitGroup
-	accepts                                                      sync.WaitGroup
-	connSlots, handSlots, dialSlots, udpSlots                    *slots
-	counters                                                     Counters
-	visionRead, visionWrite                                      atomic.Int64
+	failures                                  *failureLog
+	logicalSlots                              *slots
+	logical                                   atomic.Int64
+	ctx                                       context.Context
+	cancel                                    context.CancelFunc
+	nativeCancel                              context.CancelFunc
+	nativeContext                             context.Context
+	mu                                        sync.Mutex
+	active                                    map[net.Conn]*acceptedState
+	closing                                   bool
+	wg                                        sync.WaitGroup
+	accepts                                   sync.WaitGroup
+	connSlots, handSlots, dialSlots, udpSlots *slots
+	counters                                  Counters
 
 	// 0.7.0 runtime: log sink, statistics, connection registry, management API.
 	log          *logger
@@ -88,7 +67,6 @@ type core struct {
 	gens           map[uint64]*Server // live generations (current and retained)
 	reloadMu       sync.Mutex         // serializes Reload, Select and Close's registry access
 	bindMu         sync.RWMutex       // socket bindings: read per accepted connection, written by commit
-	runners        map[*xhttpRunner]bool
 	tcpEntries     map[string]*tcpEntry
 	udpMu          sync.Mutex
 	udpEntries     map[string]*ssUDPListener
@@ -96,16 +74,6 @@ type core struct {
 	reloadFailures atomic.Int64
 	lastReload     atomic.Pointer[ReloadResult]
 	loader         func() (Config, error)
-
-	providers  map[string]*providerRT
-	provMu     sync.Mutex
-	rebuildCh  chan struct{}
-	providerWG sync.WaitGroup
-
-	// select groups: runtime choices (persisted next to the statistics file).
-	selMu      sync.Mutex
-	selections map[string]selRecord
-	selPath    string
 
 	// Server certificates and inbound protection are process-owned.
 	tlsrt      tlsRuntime
@@ -122,7 +90,6 @@ type core struct {
 // generation; its exported methods always act on the running process.
 type Server struct {
 	*core
-	rt          *routingRuntime
 	dns         *internalDNS
 	cfg         Config
 	pool        *bufferPool
@@ -165,19 +132,14 @@ func newCore(c *Config) (*core, error) {
 	}
 	k.log = lg
 	k.failures = &failureLog{write: func(b []byte) error { return lg.emit(levelWarn, b) }, allow: func() bool { return lg.enabled(levelWarn) }}
-	k.events = &eventLog{write: func(b []byte) error { return lg.emit(eventLevel(b), b) }, allow: func(event string) bool { return lg.enabled(eventLevelOf(event)) }}
 	k.started = time.Now()
 	k.detailsOn.Store(c.connectionDetails())
 	k.flows = map[uint64]*flow{}
-	k.reg = stats.New(nil, nil, nil, nil, k.started)
+	k.reg = stats.New(nil, nil, nil, k.started)
 	k.nativeContext, k.nativeCancel = context.WithCancel(ctx)
 	k.tcpEntries = map[string]*tcpEntry{}
-	k.runners = map[*xhttpRunner]bool{}
 	k.api = &apiState{}
 	k.udpEntries = map[string]*ssUDPListener{}
-	k.providers = map[string]*providerRT{}
-	k.rebuildCh = make(chan struct{}, 1)
-	k.selections = map[string]selRecord{}
 	k.guard = newSourceGuard(k)
 	return k, nil
 }
@@ -185,7 +147,6 @@ func newCore(c *Config) (*core, error) {
 // shutdownCore releases the shared sinks after a failed Start.
 func (k *core) shutdownCore() {
 	k.cancel()
-	k.events.shutdown()
 	k.failures.shutdown()
 	k.releaseStatsLock()
 	k.log.shutdown()
@@ -212,22 +173,6 @@ func Start(c Config) (*Server, error) {
 	// that persisted selections apply to it.
 	k.openState(&c)
 	k.reloadMu.Lock()
-	prov := k.syncProviders(&c, true)
-	notes, expandErr := expandProviders(&c, prov.next)
-	if expandErr == nil {
-		expandErr = prov.err
-	}
-	if expandErr != nil {
-		k.reloadMu.Unlock()
-		k.shutdownCore()
-		return nil, expandErr
-	}
-	prov.notes = append(prov.notes, notes...)
-	if e := c.Validate(); e != nil {
-		k.reloadMu.Unlock()
-		k.shutdownCore()
-		return nil, e
-	}
 	s, plan, e := k.prepare(c, nil)
 	if e != nil {
 		k.reloadMu.Unlock()
@@ -235,9 +180,6 @@ func Start(c Config) (*Server, error) {
 		return nil, startError(e)
 	}
 	k.commit(s, plan)
-	k.installProviders(prov)
-	k.providerWG.Add(1)
-	go func() { defer k.providerWG.Done(); k.rebuildLoop() }()
 	k.startStats(&c)
 	k.startAPI(&c)
 	k.reloadMu.Unlock()
@@ -318,20 +260,13 @@ func (k *core) acceptLoop(e *tcpEntry) {
 			continue
 		}
 		delay = 0
-		g, idx, xr := k.refEntry(e)
+		g, idx := k.refEntry(e)
 		if g == nil {
 			c.Close()
 			continue
 		}
 		if !g.screen(c, &g.cfg.Inbounds[idx]) {
 			g.unref()
-			continue
-		}
-		if xr != nil {
-			in := &g.cfg.Inbounds[idx]
-			cfg, timeout := in.tlsConfig, g.cfg.Limits.HandshakeTimeout.value()
-			g.unref()
-			k.acceptXHTTP(c, xr, cfg, timeout)
 			continue
 		}
 		in := g.cfg.Inbounds[idx]
@@ -414,14 +349,6 @@ func (s *Server) handle(raw net.Conn, in Inbound) {
 		s.wg.Done()
 	}()
 	raw.SetDeadline(time.Now().Add(s.cfg.Limits.HandshakeTimeout.value()))
-	if in.Protocol == "vless" {
-		s.handleVLESS(raw, in, releaseHand)
-		return
-	}
-	if in.Protocol == "snell" {
-		s.handleSnell(raw, in, releaseHand)
-		return
-	}
 	var c net.Conn = raw
 	// The client address travels in the context for src_ip_cidr routing and,
 	// truncated, for the optional details/access log; the inbound index marks
@@ -488,38 +415,19 @@ func (s *Server) handle(raw net.Conn, in Inbound) {
 		return
 	}
 	if req.Command == 1 {
-		// Sniffing (0.7.0): a SOCKS5 client waits for the reply before it
-		// sends data, so it is answered first on sniffed ports.
-		var early func() error
-		if req.Mode == "socks5" {
-			cc := c
-			early = func() error { return req.respond(cc, nil, true) }
-		}
-		sctx, sc, first, responded, e := s.sniffTCP(ctx, c, req.Target, early)
-		if e != nil {
-			return
-		}
-		c = sc
-		f, fctx := s.newFlow(sctx, "tcp", req.Target)
+		f, fctx := s.newFlow(ctx, "tcp", req.Target)
 		out, e := s.dial(fctx, req.Target)
 		if e != nil {
 			f.end(dialResult(e))
-			if !responded {
-				req.respond(c, nil, false)
-			}
+			req.respond(c, nil, false)
 			return
 		}
 		defer f.end("ok")
 		defer out.Close()
-		if !responded {
-			if e := req.respond(c, out.LocalAddr(), true); e != nil {
-				if !quietFailure(e) {
-					s.failure(failTCPIO, in.Protocol, in.logIndex)
-				}
-				return
+		if e := req.respond(c, out.LocalAddr(), true); e != nil {
+			if !quietFailure(e) {
+				s.failure(failTCPIO, in.Protocol, in.logIndex)
 			}
-		}
-		if e := forwardSniffed(fctx, out, first); e != nil {
 			return
 		}
 		// fctx is s.ctx plus values (and, with details, a per-connection cancel).
@@ -543,7 +451,7 @@ func (s *Server) handle(raw net.Conn, in Inbound) {
 	}
 }
 func (s *Server) dial(ctx context.Context, a Address) (net.Conn, error) {
-	start, parent := time.Now(), ctx
+	parent := ctx
 	ctx, cancel := context.WithTimeout(ctx, s.cfg.Limits.DialTimeout.value())
 	defer cancel()
 	if a.Port == 0 {
@@ -558,10 +466,8 @@ func (s *Server) dial(ctx context.Context, a Address) (net.Conn, error) {
 	s.counters.Dials.Add(1)
 	defer func() { s.dialSlots.release(); s.counters.Dials.Add(-1) }()
 	f := flowOf(parent)
-	// override_destination: an IP target becomes the sniffed domain.
-	a = sniffOf(parent).target(a)
-	if !s.networkPolicy() {
-		f.route(0, []string{"direct"})
+	f.route(0, []string{"direct"})
+	if !s.customDNS() {
 		c, e := s.directDialer().DialContext(ctx, "tcp", a.String())
 		if blockedError(e) {
 			s.failure(failBlocked, "outbound", -1)
@@ -570,19 +476,13 @@ func (s *Server) dial(ctx context.Context, a Address) (net.Conn, error) {
 		s.outboundFailure(e)
 		return c, e
 	}
-	d, host, e := s.decide(ctx, "tcp", a, sourceOf(parent))
-	if e == nil || errors.Is(e, errRouteReject) {
-		f.route(d.Rule, []string{decisionHead(d)})
-	}
+	ips, e := s.lookup(ctx, a.Host)
 	if e != nil {
 		s.resolutionFailure(e)
 		return nil, e
 	}
-	if d.Kind == route.Proxy {
-		return s.dialProxy(parent, start, d.Outbound, host, a.Port)
-	}
 	blocked := 0
-	for _, ip := range d.Candidates {
+	for _, ip := range ips {
 		if s.cfg.blockedDestination(ip) {
 			blocked++
 			continue
@@ -595,23 +495,12 @@ func (s *Server) dial(ctx context.Context, a Address) (net.Conn, error) {
 			return nil, ctx.Err()
 		}
 	}
-	if blocked == len(d.Candidates) {
+	if blocked == len(ips) {
 		s.failure(failBlocked, "outbound", -1)
 		return nil, errBlocked
 	}
 	s.failure(failDial, "outbound", -1)
 	return nil, errors.New("destination dial failed")
-}
-
-// decisionHead is the first element of the outbound chain of a decision.
-func decisionHead(d route.Decision) string {
-	switch d.Kind {
-	case route.Proxy:
-		return d.Outbound
-	case route.Reject:
-		return "reject"
-	}
-	return "direct"
 }
 
 // dialResult classifies a dial error for the access log.
@@ -620,8 +509,6 @@ func dialResult(e error) string {
 	switch {
 	case blockedError(e):
 		return "blocked"
-	case errors.Is(e, errRouteReject), errors.Is(e, outbound.ErrRejected):
-		return "rejected"
 	case errors.Is(e, errDNS), errors.As(e, &dns):
 		return "dns_failed"
 	case errors.Is(e, context.Canceled):
@@ -653,11 +540,7 @@ func (s *Server) Close(ctx context.Context) error {
 		u.socket.Close()
 	}
 	k.udpMu.Unlock()
-	for r := range k.runners {
-		r.close()
-	}
 	k.reloadMu.Unlock()
-	k.stopProviders()
 	k.nativeCancel()
 	k.accepts.Wait()
 	done := make(chan struct{})
@@ -689,12 +572,10 @@ func (s *Server) Close(ctx context.Context) error {
 		u.releaseRcvBuf()
 	}
 	k.cancel()
-	k.providerWG.Wait()
 	// Every connection has ended: the current generation is the last one.
 	if cur := k.gen.Load(); cur != nil {
 		cur.supersede()
 	}
-	k.events.shutdown()
 	k.failures.shutdown()
 	// Every flow has ended: the final save sees all transferred bytes.
 	k.stopStats()

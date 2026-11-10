@@ -311,31 +311,6 @@ func manage(args []string, w io.Writer) error {
 		}
 		fmt.Fprintf(w, "configuration reloaded (generation %d, %d ms)\n", r.Generation, r.DurationMS)
 		return nil
-	case cmd == "select" && len(c.rest) == 0:
-		var raw json.RawMessage
-		if e := cl.do("GET", "/v1/select", nil, &raw); e != nil {
-			return apiFail(e)
-		}
-		if c.json {
-			_, e := w.Write(raw)
-			return e
-		}
-		var list []kernel.SelectGroup
-		if e := json.Unmarshal(raw, &list); e != nil {
-			return cliError{"unexpected select response"}
-		}
-		if len(list) == 0 {
-			fmt.Fprintln(w, "no select groups")
-			return nil
-		}
-		for _, g := range list {
-			src := "configuration"
-			if g.Source == "runtime" {
-				src = "runtime choice"
-			}
-			fmt.Fprintf(w, "%s: %s (%s; configured %s)\n  members: %s\n", g.Name, g.Current, src, g.Default, strings.Join(g.Members, ", "))
-		}
-		return nil
 	case cmd == "bans" && len(c.rest) == 0:
 		var raw json.RawMessage
 		if e := cl.do("GET", "/v1/bans", nil, &raw); e != nil {
@@ -370,12 +345,6 @@ func manage(args []string, w io.Writer) error {
 			return apiFail(e)
 		}
 		fmt.Fprintf(w, "%s: ban removed\n", c.rest[1])
-		return nil
-	case cmd == "select" && len(c.rest) == 2:
-		if e := cl.do("PUT", "/v1/select/"+url.PathEscape(c.rest[0]), map[string]string{"member": c.rest[1]}, nil); e != nil {
-			return apiFail(e)
-		}
-		fmt.Fprintf(w, "%s: selected %s (new connections only)\n", c.rest[0], c.rest[1])
 		return nil
 	}
 	return cliError{usage}
@@ -440,9 +409,6 @@ func printStats(w io.Writer, v kernel.StatsView) {
 	}
 	section("inbounds", c.Inbounds)
 	section("outbounds", c.Outbounds)
-	if len(c.Groups) > 0 {
-		section("groups", c.Groups)
-	}
 	fmt.Fprintf(tw, "rules:\t\t\n")
 	for _, r := range c.Rules {
 		fmt.Fprintf(tw, "  %s\thits %d\tup %s (%d)\tdown %s (%d)\n", r.Name, r.Hits, human(r.Up), r.Up, human(r.Down), r.Down)

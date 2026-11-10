@@ -3,7 +3,6 @@ package kernel
 import (
 	"crypto/sha256"
 	"errors"
-	"github.com/shui1iao/Kat/internal/snell"
 	"github.com/shui1iao/Kat/internal/ss"
 	"reflect"
 	"strings"
@@ -26,14 +25,6 @@ type SSOptions struct {
 func (o SSOptions) protection() SSOptions {
 	o.UDPRcvBuf2017 = 0
 	return o
-}
-
-type SnellOptions struct {
-	Version        int    `json:"version"`
-	PSK            string `json:"psk"`
-	Obfs           string `json:"obfs,omitempty"`
-	MaxRequests    int    `json:"max_requests,omitempty"`
-	ReplayCapacity int    `json:"replay_capacity,omitempty"`
 }
 
 func (o *SSOptions) key() ([]byte, error) {
@@ -85,55 +76,18 @@ func (o *SSOptions) validate() error {
 	}
 	return nil
 }
-func (o *SnellOptions) validate() error {
-	if o == nil {
-		return errors.New("Snell options required")
-	}
-	if o.Version != 4 && o.Version != 5 {
-		return errors.New("only Snell v4/v5 conventional supported")
-	}
-	if o.Obfs == "" {
-		o.Obfs = "none"
-	}
-	if o.Obfs != "none" && o.Obfs != "http" {
-		return errors.New("Snell obfs must be none or http")
-	}
-	if len(o.PSK) < 1 || len(o.PSK) > 4096 {
-		return errors.New("invalid Snell PSK")
-	}
-	if o.MaxRequests == 0 {
-		o.MaxRequests = 1024
-	}
-	if o.ReplayCapacity == 0 {
-		o.ReplayCapacity = 4096
-	}
-	if o.MaxRequests < 1 || o.MaxRequests > 1<<20 || o.ReplayCapacity < 1 || o.ReplayCapacity > 1<<20 {
-		return errors.New("invalid Snell resource limit")
-	}
-	return nil
-}
 
-// prepareEncrypted creates the SS and Snell codecs. A codec of the previous
-// generation with an identical configuration is reused, so replay windows,
-// budgets and SS UDP associations continue across a reload.
+// prepareEncrypted creates the SS codecs. A codec of the previous generation
+// with an identical configuration is reused, so replay windows, budgets and SS
+// UDP associations continue across a reload.
 func (s *Server) prepareEncrypted(prev *Server) error {
 	ssByID := map[string]*ssRuntime{}
 	ssOpts := map[string]SSOptions{}
-	snByID := map[[32]byte]*snell.Server{}
-	snOpts := map[[32]byte]SnellOptions{}
 	var prevSS []*ssRuntime
-	type snPrev struct {
-		conf  snell.Config
-		codec *snell.Server
-	}
-	var prevSn []snPrev
 	if prev != nil {
 		for _, in := range prev.cfg.Inbounds {
 			if in.ssRuntime != nil {
 				prevSS = append(prevSS, in.ssRuntime)
-			}
-			if in.snellServer != nil {
-				prevSn = append(prevSn, snPrev{in.snellConf, in.snellServer})
 			}
 		}
 	}
@@ -165,33 +119,6 @@ func (s *Server) prepareEncrypted(prev *Server) error {
 				ssOpts[id] = *in.SS
 			}
 			in.ssRuntime = rt
-		}
-		if in.Protocol == "snell" {
-			id := sha256.Sum256([]byte(in.Snell.PSK))
-			if prev, ok := snOpts[id]; ok && (prev.Obfs != in.Snell.Obfs || prev.MaxRequests != in.Snell.MaxRequests || prev.ReplayCapacity != in.Snell.ReplayCapacity) {
-				return errors.New("same Snell PSK requires identical obfs and protection settings")
-			}
-			codec := snByID[id]
-			conf := snell.Config{PSK: []byte(in.Snell.PSK), Obfs: in.Snell.Obfs, MaxSessions: s.cfg.Limits.Connections, MaxRequests: in.Snell.MaxRequests, ReplayCapacity: in.Snell.ReplayCapacity}
-			if codec == nil {
-				for _, p := range prevSn {
-					if reflect.DeepEqual(p.conf, conf) {
-						codec = p.codec
-						break
-					}
-				}
-			}
-			if codec == nil {
-				var e error
-				codec, e = snell.NewServer(conf)
-				if e != nil {
-					return errors.New("cannot initialize Snell protection")
-				}
-			}
-			snByID[id] = codec
-			snOpts[id] = *in.Snell
-			in.snellServer = codec
-			in.snellConf = conf
 		}
 	}
 	return nil

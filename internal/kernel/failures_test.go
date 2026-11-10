@@ -60,9 +60,8 @@ func TestFailureClassifiersIgnoreInputsAndNormalEOF(t *testing.T) {
 		t.Fatal("normal close not silent")
 	}
 	s.outboundFailure(&net.DNSError{Err: "secret-password", Name: "private-target.example"})
-	s.outboundFailure(fmt.Errorf("%w: private-target.example", errRouteReject))
 	s.outboundFailure(errors.New("203.0.113.7 secret-key payload"))
-	for _, word := range []string{"dns_failed", "rule_reject", "connect_failed"} {
+	for _, word := range []string{"dns_failed", "connect_failed"} {
 		if !strings.Contains(b.String(), word) {
 			t.Fatal(word)
 		}

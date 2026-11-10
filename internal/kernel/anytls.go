@@ -201,8 +201,7 @@ func (s *Server) serveAnyTLS(parent context.Context, c net.Conn, in Inbound) {
 			return
 		}
 		target := Address{r.Target.Host, r.Target.Port}
-		sctx, sstream, first, _, _ := s.sniffTCP(ctx, stream, target, nil)
-		f, fctx := s.newFlow(sctx, "tcp", target)
+		f, fctx := s.newFlow(ctx, "tcp", target)
 		out, e := s.dial(fctx, target)
 		if e != nil {
 			f.end(dialResult(e))
@@ -210,10 +209,7 @@ func (s *Server) serveAnyTLS(parent context.Context, c net.Conn, in Inbound) {
 		}
 		defer f.end("ok")
 		defer out.Close()
-		if forwardSniffed(fctx, out, first) != nil {
-			return
-		}
-		s.relayAnyTLS(fctx, sstream, out)
+		s.relayAnyTLS(fctx, stream, out)
 	})
 	if k, ok := anyTLSFailure(e); ok {
 		s.failure(k, in.Protocol, in.logIndex)

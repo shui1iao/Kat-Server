@@ -1,4 +1,0 @@
-+.plus.example
-exact.example
-.dot.example
-*.star.example

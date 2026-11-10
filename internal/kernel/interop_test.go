@@ -26,7 +26,7 @@ func TestXrayIndependentPeer(t *testing.T) {
 		p      string
 		tls    bool
 		method string
-	}{{"trojan", true, ""}, {"vless", false, ""}, {"vless", true, ""}, {"shadowsocks", false, "aes-128-gcm"}, {"shadowsocks", false, "aes-256-gcm"}, {"shadowsocks", false, "chacha20-ietf-poly1305"}, {"shadowsocks", false, "2022-blake3-aes-128-gcm"}, {"shadowsocks", false, "2022-blake3-aes-256-gcm"}, {"shadowsocks", false, "2022-blake3-chacha20-poly1305"}} {
+	}{{"trojan", true, ""}, {"shadowsocks", false, "aes-128-gcm"}, {"shadowsocks", false, "aes-256-gcm"}, {"shadowsocks", false, "chacha20-ietf-poly1305"}, {"shadowsocks", false, "2022-blake3-aes-128-gcm"}, {"shadowsocks", false, "2022-blake3-aes-256-gcm"}, {"shadowsocks", false, "2022-blake3-chacha20-poly1305"}} {
 		t.Run(fmt.Sprintf("%s-%s-tls%v", tc.p, tc.method, tc.tls), func(t *testing.T) {
 			var cfg *TLSConfig
 			if tc.tls {

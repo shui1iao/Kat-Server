@@ -17,7 +17,6 @@ func (w anyTLSUpReadActivity) Write(p []byte) (int, error) {
 	w.last.Store(time.Now().UnixNano())
 	return w.Writer.Write(p)
 }
-func (s *Server) copyAnyTLSUp(dst, src net.Conn) error { return s.copyAnyTLSUpM(dst, src, meter{}) }
 
 func (s *Server) copyAnyTLSUpM(dst, src net.Conn, m meter) error {
 	raw := src

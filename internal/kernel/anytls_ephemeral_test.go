@@ -176,7 +176,7 @@ func TestOtherProtocolsTLSRulesUnchanged(t *testing.T) {
 		}
 	}
 	// No other protocol receives an ephemeral certificate.
-	c, e := Load(writeConfig(t, `{"inbounds":[{"protocol":"socks5","listen":"127.0.0.1:0"},{"protocol":"vless","listen":"127.0.0.1:0","users":[{"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}]}`))
+	c, e := Load(writeConfig(t, `{"inbounds":[{"protocol":"socks5","listen":"127.0.0.1:0"},{"protocol":"shadowsocks","listen":"127.0.0.1:0","ss":{"method":"aes-128-gcm","password":"p"}}]}`))
 	if e != nil {
 		t.Fatal(e)
 	}

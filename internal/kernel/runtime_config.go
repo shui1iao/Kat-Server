@@ -161,12 +161,6 @@ func (c *Config) ApplyDefaultPaths(socket, statsFile string) {
 }
 
 // APISocket returns the configured management socket path ("" = none).
-func (c *Config) APISocket() string {
-	if c.API == nil || (c.API.Enabled != nil && !*c.API.Enabled) {
-		return ""
-	}
-	return c.API.Socket
-}
 
 // destination guard ---------------------------------------------------------
 

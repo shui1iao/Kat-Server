@@ -109,7 +109,6 @@ type StatsView struct {
 	Persist     PersistView    `json:"persist"`
 	Details     bool           `json:"details_enabled"`
 	Cumulative  stats.Snapshot `json:"cumulative"`
-	Providers   []ProviderView `json:"providers,omitempty"`
 	Reload      ReloadView     `json:"reload"`
 	Security    SecurityView   `json:"security"`
 }
@@ -147,7 +146,7 @@ func (s *core) statsView() StatsView {
 	v := StatsView{Version: Version, UptimeMS: time.Since(s.started).Milliseconds(), Rate: RateView{up, down, w.Milliseconds()},
 		Connections: ConnCounts{TCP: s.tcpFlows.Load(), UDP: s.counters.UDP.Load(), Accepted: s.counters.Active.Load(), Rejected: s.counters.Rejected.Load()},
 		Persist:     PersistView{File: path, Enabled: path != "", SaveErrors: s.saveErrors.Load()},
-		Details:     s.detailsOn.Load(), Cumulative: s.reg.Snapshot(), Reload: s.reloadView(), Security: s.securityView(), Providers: s.providerViews()}
+		Details:     s.detailsOn.Load(), Cumulative: s.reg.Snapshot(), Reload: s.reloadView(), Security: s.securityView()}
 	if t := s.lastSave.Load(); t != 0 {
 		v.Persist.LastSave = time.Unix(0, t)
 	}
@@ -222,25 +221,6 @@ func (b apiBackend) RemoveBan(source string) (bool, error) {
 		return false, &api.Failure{Code: "bad_source", Message: e.Error()}
 	}
 	return found, nil
-}
-func (b apiBackend) SelectGroups() any {
-	g := b.k.gen.Load()
-	if g == nil {
-		return []SelectGroup{}
-	}
-	return g.SelectGroups()
-}
-func (b apiBackend) Select(name, member string) error {
-	g := b.k.gen.Load()
-	if g == nil {
-		return errors.New("not running")
-	}
-	e := g.Select(name, member)
-	var se *SelectError
-	if errors.As(e, &se) {
-		return &api.Failure{Code: se.Code, Message: se.Msg}
-	}
-	return e
 }
 
 // Info writes a CLI startup line (e.g. "listening ...") through the

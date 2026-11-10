@@ -3,7 +3,6 @@ package kernel
 import (
 	"context"
 	"errors"
-	"github.com/shui1iao/Kat/internal/outbound"
 	"github.com/shui1iao/Kat/internal/ss"
 	"net"
 	"net/netip"
@@ -196,7 +195,7 @@ func (k *core) readSSUDP(l *ssUDPListener) {
 				s.unref()
 				continue
 			}
-			base := withInbound(outbound.WithSource(s.nativeContext, source.Addr()), logIndex)
+			base := withInbound(withSourceIP(s.nativeContext, source.Addr()), logIndex)
 			base = withInboundMeta(base, &s.cfg.Inbounds[logIndex], l.socket.LocalAddr(), net.UDPAddrFromAddrPort(source))
 			f, fctx := s.newFlow(base, "udp", Address{})
 			ctx, cancel := context.WithCancel(fctx)

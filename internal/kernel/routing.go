@@ -2,72 +2,135 @@ package kernel
 
 import (
 	"context"
-	"errors"
+	"net"
 	"net/netip"
 	"strings"
-
-	"github.com/shui1iao/Kat/internal/route"
 )
 
-var errRouteReject = errors.New("destination rejected by routing")
-
-func (r RouteRule) matchDomain(name string) bool {
-	return name != "" && (r.Domain == name || r.DomainSuffix != "" && (name == r.DomainSuffix || strings.HasSuffix(name, "."+r.DomainSuffix)))
-}
-
-// Only explicit system DNS with no rules/final proxy keeps the original fast path.
-func (s *Server) networkPolicy() bool {
-	return s.dns != nil && len(s.dns.upstreams) > 0 || s.cfg.Routing != nil && (len(s.cfg.Routing.Rules) > 0 || s.cfg.Routing.Final != "" && s.cfg.Routing.Final != "direct")
-}
-
-// routeDirect is the legacy (pre-engine) per-candidate evaluation of legacy
-// rules. Forwarding uses the route engine (decide); this is kept as the
-// reference the existing selector-normalization tests compare against.
-func (s *Server) routeDirect(name string, ip netip.Addr) bool {
-	if s.cfg.Routing == nil {
-		return true
-	}
-	ip = ip.Unmap()
-	for _, r := range s.cfg.Routing.Rules {
-		if r.matchDomain(name) || r.IPCIDR != "" && r.prefix.Contains(ip) {
-			return r.Action == "direct"
+// lookup resolves host using Kat's DNS configuration (system or configured upstreams).
+func (s *Server) lookup(ctx context.Context, host string) ([]netip.Addr, error) {
+	if ip, e := netip.ParseAddr(host); e == nil {
+		if ip.Zone() != "" {
+			return nil, errDNS
 		}
+		return []netip.Addr{ip.Unmap()}, nil
 	}
-	return true
+	name, e := dnsName(host)
+	if e != nil {
+		return nil, errDNS
+	}
+	if s.dns == nil {
+		return net.DefaultResolver.LookupNetIP(ctx, "ip", name)
+	}
+	return s.dns.lookup(ctx, name)
 }
 
-// routeUDP decides one datagram. Without a network policy it is exactly the
-// original resolve (system DNS, first address). Otherwise it holds one shared
-// dialSlots reservation for the decision (including DNS) and returns either
-// the direct candidates or the outbound name plus normalized host.
-func (s *Server) routeUDP(ctx context.Context, a Address, src netip.Addr) (candidates []netip.AddrPort, proxy, host string, rule int, err error) {
-	if !s.networkPolicy() {
-		ip, e := s.resolve(ctx, sniffOf(ctx).target(a))
+// customDNS reports whether custom DNS upstreams are configured instead of system DNS.
+func (s *Server) customDNS() bool {
+	return s.dns != nil && len(s.dns.upstreams) > 0
+}
+
+// routeUDP resolves a datagram target. With system DNS it uses s.resolve (single
+// address); with custom DNS upstreams it acquires a dial slot and resolves all
+// candidate addresses via s.lookup.
+func (s *Server) routeUDP(ctx context.Context, a Address) ([]netip.AddrPort, error) {
+	if !s.customDNS() {
+		ip, e := s.resolve(ctx, a)
 		if e != nil {
-			return nil, "", "", 0, e
+			return nil, e
 		}
-		return []netip.AddrPort{ip}, "", "", 0, nil
+		return []netip.AddrPort{ip}, nil
+	}
+	if a.Port == 0 {
+		return nil, errDNS
 	}
 	ctx, cancel := context.WithTimeout(ctx, s.cfg.Limits.DialTimeout.value())
 	defer cancel()
 	if e := s.dialSlots.acquire(ctx); e != nil {
-		return nil, "", "", -1, e
+		return nil, e
 	}
 	s.counters.Dials.Add(1)
 	defer func() { s.dialSlots.release(); s.counters.Dials.Add(-1) }()
-	d, host, e := s.decide(ctx, "udp", a, src)
+	ips, e := s.lookup(ctx, a.Host)
 	if e != nil {
-		if errors.Is(e, errRouteReject) {
-			return nil, "", "", d.Rule, e
-		}
-		return nil, "", "", -1, e
+		return nil, e
 	}
-	if d.Kind == route.Proxy {
-		return nil, d.Outbound, host, d.Rule, nil
-	}
-	out := make([]netip.AddrPort, 0, len(d.Candidates))
-	for _, ip := range d.Candidates {
+	out := make([]netip.AddrPort, 0, len(ips))
+	for _, ip := range ips {
 		out = append(out, netip.AddrPortFrom(ip, a.Port))
 	}
-	return out, "", host, d.Rule, nil
+	return out, nil
 }
+
+// ---- client source and inbound metadata ----
+
+type sourceKey struct{}
+
+func withSource(ctx context.Context, a net.Addr) context.Context {
+	if sourceOf(ctx).IsValid() {
+		return ctx
+	}
+	ip := addrIP(a)
+	if !ip.IsValid() {
+		return ctx
+	}
+	return withSourceIP(ctx, ip)
+}
+
+func withSourceIP(ctx context.Context, ip netip.Addr) context.Context {
+	if !ip.IsValid() {
+		return ctx
+	}
+	return context.WithValue(ctx, sourceKey{}, ip.WithZone("").Unmap())
+}
+
+func sourceOf(ctx context.Context) netip.Addr {
+	if ctx == nil {
+		return netip.Addr{}
+	}
+	ip, _ := ctx.Value(sourceKey{}).(netip.Addr)
+	return ip
+}
+
+func addrIP(a net.Addr) netip.Addr {
+	switch v := a.(type) {
+	case *net.TCPAddr:
+		if v == nil {
+			return netip.Addr{}
+		}
+		return v.AddrPort().Addr().WithZone("").Unmap()
+	case *net.UDPAddr:
+		if v == nil {
+			return netip.Addr{}
+		}
+		return v.AddrPort().Addr().WithZone("").Unmap()
+	case nil:
+		return netip.Addr{}
+	}
+	ap, e := netip.ParseAddrPort(a.String())
+	if e != nil {
+		return netip.Addr{}
+	}
+	return ap.Addr().WithZone("").Unmap()
+}
+
+type inboundMeta struct {
+	name, typ string
+}
+
+type inMetaKey struct{}
+
+func withInboundMeta(ctx context.Context, in *Inbound, _, _ net.Addr) context.Context {
+	return context.WithValue(ctx, inMetaKey{}, &inboundMeta{name: in.Name, typ: in.Protocol})
+}
+
+func inboundMetaOf(ctx context.Context) *inboundMeta {
+	m, _ := ctx.Value(inMetaKey{}).(*inboundMeta)
+	return m
+}
+
+func (s *Server) currentInboundMeta(ctx context.Context, _ *Server) context.Context {
+	return ctx
+}
+
+var _ = strings.TrimSuffix

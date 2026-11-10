@@ -31,16 +31,7 @@ func TestFailureRealDNSRouteDialAndBudget(t *testing.T) {
 		c.Close()
 		t.Fatal("no-answer DNS accepted")
 	}
-	before := f.count.Load()
-	s.cfg.Routing = &RoutingOptions{Rules: []RouteRule{{Domain: "secret-target.example", Action: "reject"}}}
-	if c, e := s.dial(s.ctx, Address{"secret-target.example", 9}); e == nil {
-		c.Close()
-		t.Fatal("reject dialed")
-	}
-	if f.count.Load() != before {
-		t.Fatal("domain reject queried")
-	}
-	s.cfg.Routing = nil
+
 	ln, e := net.Listen("tcp4", "127.0.0.1:0")
 	if e != nil {
 		t.Fatal(e)
@@ -57,7 +48,7 @@ func TestFailureRealDNSRouteDialAndBudget(t *testing.T) {
 	if e == nil {
 		t.Fatal("budget timeout missing")
 	}
-	for _, reason := range []string{"dns_failed", "rule_reject", "connect_failed", "budget_wait_timeout"} {
+	for _, reason := range []string{"dns_failed", "connect_failed", "budget_wait_timeout"} {
 		if !strings.Contains(b.String(), reason) {
 			t.Fatal("missing actual failure category", reason)
 		}

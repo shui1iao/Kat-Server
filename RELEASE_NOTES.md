@@ -1,19 +1,12 @@
-# Kat-Server v0.8.0
+# Kat-Server v0.8.1
 
-仅发布，不自动部署或升级现有服务。原Kat仓库改名Kat-Server，旧标签/附件保留；命令kat、Go模块路径和Linux附件命名契约不变。
+仅发布，不自动部署或升级现有服务。命令 `kat`、Go 模块路径和 Linux 附件命名契约不变。同提交对应的独立 Windows 客户端内核发布于 `windows-core-v0.8.1`（`make_latest=false`）。
 
 ## 本版变化
-- TCP 转发半关闭清理与传输稳定性：`quietFailure` 纳入 `syscall.ECONNABORTED`；`relayIdle` 在第一方向正常 EOF（`err == nil`）后，若第二方向返回 `quietFailure(e)`（如 `net.ErrClosed`、`io.ErrClosedPipe`、`ECONNRESET`、`ECONNABORTED`），保持 `err = nil`，避免正常半关闭收尾被误计为连接错误。
-- DNS默认有序链改为8.8.8.8 → 1.1.1.1 → 系统DNS；支持有序servers，瞬时失败才换上游，有效负答案终止，整链共享预算，遵守真实TTL，reload保旧请求。需要原行为可显式server: system。
-- AnyTLS出站池及写队列清尾引用；carrier复用校验实际策略链，旧stream不强断。规则/地理库读取有界预分配。provider拒绝非普通文件并防FIFO阻塞，候选generation准备/提交成功后接受新快照；缓存写失败仍可能告警，不宣称磁盘与运行代完全原子。
-- Smart v2：站点学习、真实业务首响应归因、有界自适应拨号、恢复滞回、同身份reload学习继承；完整有效冷首轮之前不自动选择。
-- URLTest默认探测间隔10分钟→1分钟，默认tolerance 100ms→20ms；采用稳定样本/确认轮/停留时间；新fixed/damping/smart配置及权重语义。Fallback默认独立两轮失败（显式max_failed_times可配置，例如4），部分/重复/过时样本不算完整失败轮；LB和探测归因、冷依赖与目标预算分离。
-- 订阅支持保留节点的dialer-proxy依赖图、受支持URLTest来源组、命名空间和循环校验、include_group/原名筛选。
-
-## 明确不包含
-域名下划线校验放宽、DNS policy/hosts、SS obfs/http、单资源手动刷新API、桌面客户端功能。Windows客户端core不是此Linux入口的可互换产品。
+- **服务端与客户端职责分离精简**：`Kat-Server` 收敛为纯正式入站 + 直连转发（`direct`）服务端内核，移除实验性协议（VLESS/REALITY/Vision/XUDP/XHTTP/gRPC/WebSocket/HTTPUpgrade、Snell）以及仅客户端使用的代理出站、策略组、订阅 provider、路由规则集（SRS/MRS/GeoIP/GeoSite/ASN）与协议嗅探代码及对应第三方依赖；保留 SOCKS5、Shadowsocks 2017/2022、Trojan、AnyTLS 五类正式入站，以及直连 DNS、TLS/ACME/TFO、入站安全封禁、流量统计、管理 API 与原子热重载。
+- **配置边界显式校验**：服务端配置若包含客户端专属字段（`outbounds`、`groups`、`providers`、`routing`、`rule_sets`、`geoip`、`geosite`、`asn` 或入站 `sniff`），`kat check`、启动与重载均明确拒绝报错，不静默忽略。
+- **继承 v0.8.0 传输稳定性修复**：保持 TCP 转发半关闭静默收敛（`ECONNABORTED` 与单向正常 EOF 后另一方向 `quietFailure` 不误计失败）、AnyTLS 会话授权与热重载原子性。
+- **Windows Core `v0.8.1`（`windows-core-v0.8.1` Release）**：同步完成协议精简、规则集内存结构优化（紧凑后缀表 + 规则靶向编译）、HTTP 探测/订阅桥空闲连接回收、已完成 TUN 恢复账本 LUID/PID 复用退休修复，以及 AnyTLS 复用会话 0-RTT 开流、SS2022 客户端缓冲复用和 TUN 栈读写零分配优化（`sequence: 1794300002`）。
 
 ## 验证与权利
-本次在Hytron隔离执行group/AnyTLS/provider/route回归、kernel Chain/Provider/DNS/Reload回归，以及Linux完整构建；旧测试按已接受冷首轮/独立失败轮契约适配，保留原失败记录。DoH证书测试改用独立Transport消除fixture并发修改，不改DNS生产语义。未部署现网或Bero，不宣称所有协议/生产负载完整验收。
-
-自研代码权利声明及第三方原许可不变；对应第三方源码/修改/许可见本tag。
+本次在 Hytron 完成 `Kat-Server` 全包单元测试与 `go vet`，以及 Linux amd64 静态二进制构建与 CLI 版本核验。自研代码保留所有权利，第三方组件继续遵循各自原许可（详见 `THIRD_PARTY_NOTICES.md` 与 `kat-0.8.1-third-party-licenses.txt`）。

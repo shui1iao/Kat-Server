@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
+	"fmt"
 	"math/big"
 	"strings"
 	"time"
@@ -20,15 +21,22 @@ import (
 // in-memory certificate; one that writes "tls" (including null) keeps the
 // strict cert/key rules. Key matching follows encoding/json (case-insensitive).
 func (in *Inbound) UnmarshalJSON(b []byte) error {
+	var m map[string]json.RawMessage
+	if e := json.Unmarshal(b, &m); e != nil {
+		return e
+	}
+	for k := range m {
+		for _, rem := range []string{"snell", "transport", "reality", "allow_insecure", "sniff"} {
+			if strings.EqualFold(k, rem) {
+				return removedConfigError{fmt.Sprintf("inbound field %q is not supported in Kat-Server (VLESS, Snell, transports, REALITY and traffic sniffing have been removed)", rem)}
+			}
+		}
+	}
 	type plain Inbound
 	var p plain
 	d := json.NewDecoder(bytes.NewReader(b))
 	d.DisallowUnknownFields()
 	if e := d.Decode(&p); e != nil {
-		return e
-	}
-	var m map[string]json.RawMessage
-	if e := json.Unmarshal(b, &m); e != nil {
 		return e
 	}
 	for k := range m {

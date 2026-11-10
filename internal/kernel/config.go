@@ -3,21 +3,18 @@ package kernel
 import (
 	"bytes"
 	"crypto/tls"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	A "github.com/shui1iao/Kat/internal/anytls"
-	"github.com/shui1iao/Kat/internal/route"
-	"github.com/shui1iao/Kat/internal/snell"
-	VX "github.com/shui1iao/Kat/internal/vlessx"
-	VT "github.com/shui1iao/Kat/internal/vtransport"
-	XH "github.com/shui1iao/Kat/internal/xhttp"
 	"io"
 	"net"
 	"net/netip"
 	"os"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 type Duration time.Duration
@@ -37,12 +34,38 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 func (d Duration) MarshalJSON() ([]byte, error) { return json.Marshal(time.Duration(d).String()) }
 func (d Duration) value() time.Duration         { return time.Duration(d) }
 
+type removedConfigError struct{ msg string }
+
+func (e removedConfigError) Error() string { return e.msg }
+
 type User struct {
-	Flow     string `json:"flow,omitempty"`
 	Username string `json:"username,omitempty"`
 	Password string `json:"password,omitempty"`
-	UUID     string `json:"uuid,omitempty"`
 }
+
+func (u *User) UnmarshalJSON(b []byte) error {
+	var m map[string]json.RawMessage
+	if e := json.Unmarshal(b, &m); e != nil {
+		return e
+	}
+	for k := range m {
+		for _, rem := range []string{"uuid", "flow"} {
+			if strings.EqualFold(k, rem) {
+				return removedConfigError{fmt.Sprintf("user field %q is not supported in Kat-Server (VLESS has been removed)", rem)}
+			}
+		}
+	}
+	type plain User
+	var p plain
+	d := json.NewDecoder(bytes.NewReader(b))
+	d.DisallowUnknownFields()
+	if e := d.Decode(&p); e != nil {
+		return e
+	}
+	*u = User(p)
+	return nil
+}
+
 type TLSConfig struct {
 	Cert string `json:"cert"`
 	Key  string `json:"key"`
@@ -57,30 +80,21 @@ type TLSConfig struct {
 	ACME          *ACMEConfig   `json:"acme,omitempty"`
 }
 type Inbound struct {
-	logIndex      int
-	xhttpServer   *XH.Server
-	Transport     *VTransportOptions `json:"transport,omitempty"`
-	Reality       *RealityOptions    `json:"reality,omitempty"`
-	realityServer *VX.RealityServer
-	AnyTLS        *AnyTLSOptions `json:"anytls,omitempty"`
-	anytlsAuth    *anyTLSAuthority
-	anytlsServer  *A.Server
-	Protocol      string        `json:"protocol"`
-	Listen        string        `json:"listen"`
-	Users         []User        `json:"users,omitempty"`
-	TLS           *TLSConfig    `json:"tls,omitempty"`
-	AllowInsecure bool          `json:"allow_insecure,omitempty"`
-	SS            *SSOptions    `json:"ss,omitempty"`
-	Snell         *SnellOptions `json:"snell,omitempty"`
-	ssRuntime     *ssRuntime
-	snellServer   *snell.Server
-	tlsConfig     *tls.Config
-	TCPFastOpen   bool       `json:"tcp_fast_open,omitempty"`
-	serverTLS     *serverTLS // Trojan/AnyTLS certificate sources (tls_config.go)
+	logIndex     int
+	AnyTLS       *AnyTLSOptions `json:"anytls,omitempty"`
+	anytlsAuth   *anyTLSAuthority
+	anytlsServer *A.Server
+	Protocol     string     `json:"protocol"`
+	Listen       string     `json:"listen"`
+	Users        []User     `json:"users,omitempty"`
+	TLS          *TLSConfig `json:"tls,omitempty"`
+	SS           *SSOptions `json:"ss,omitempty"`
+	ssRuntime    *ssRuntime
+	tlsConfig    *tls.Config
+	TCPFastOpen  bool       `json:"tcp_fast_open,omitempty"`
+	serverTLS    *serverTLS // Trojan/AnyTLS certificate sources (tls_config.go)
 	// Codec configurations, compared by a reload to reuse identical codecs.
-	xhttpConf  XH.Config
 	anytlsConf A.Config
-	snellConf  snell.Config
 	// tlsWritten: the JSON object had a "tls" member (even null).
 	// ephemeralTLS: tlsConfig holds a generated in-memory certificate.
 	tlsWritten   bool
@@ -95,9 +109,7 @@ type Inbound struct {
 	// explicitly). Like Limits.logicalAuto, re-validation derives it again.
 	anytlsSessionsAuto int
 
-	// 0.7.0: optional name (in_name rules) and per-inbound traffic sniffing.
-	Name  string        `json:"name,omitempty"`
-	Sniff *SniffOptions `json:"sniff,omitempty"`
+	Name string `json:"name,omitempty"`
 }
 type Limits struct {
 	LogicalStreams   int      `json:"logical_streams"`
@@ -138,27 +150,15 @@ const (
 )
 
 type Config struct {
-	DNS         *DNSOptions     `json:"dns,omitempty"`
-	Routing     *RoutingOptions `json:"routing,omitempty"`
-	UDPBindIPv4 string          `json:"udp_bind_ipv4,omitempty"`
-	UDPBindIPv6 string          `json:"udp_bind_ipv6,omitempty"`
-	Inbounds    []Inbound       `json:"inbounds"`
-	Limits      Limits          `json:"limits"`
+	DNS         *DNSOptions `json:"dns,omitempty"`
+	UDPBindIPv4 string      `json:"udp_bind_ipv4,omitempty"`
+	UDPBindIPv6 string      `json:"udp_bind_ipv6,omitempty"`
+	Inbounds    []Inbound   `json:"inbounds"`
+	Limits      Limits      `json:"limits"`
 
-	// Routing core (all optional; absent = system DNS + direct as before).
-	Providers     []ProviderConfig `json:"providers,omitempty"`
-	providerNodes int
-	expanded      bool
-	raw           []byte
-	defaults      [2]string
-	stateDir      string           // default ACME storage root, retained for provider rebuilds
-	Outbounds     []OutboundConfig `json:"outbounds,omitempty"`
-	Groups        []GroupConfig    `json:"groups,omitempty"`
-	RuleSets      []RuleSetConfig  `json:"rule_sets,omitempty"`
-	GeoIP         *GeoIPConfig     `json:"geoip,omitempty"`
-	Geosite       *GeositeConfig   `json:"geosite,omitempty"`
-	ASN           *ASNConfig       `json:"asn,omitempty"`
-	route         route.Options    // normalized by Validate
+	raw      []byte
+	defaults [2]string
+	stateDir string // default ACME storage root
 
 	// Runtime (0.7.0, all optional).
 	Log      *LogOptions      `json:"log,omitempty"`
@@ -189,6 +189,10 @@ func decodeConfig(b []byte) (Config, error) {
 	d := json.NewDecoder(bytes.NewReader(b))
 	d.DisallowUnknownFields()
 	if e := d.Decode(&c); e != nil {
+		var re removedConfigError
+		if errors.As(e, &re) {
+			return c, re
+		}
 		return c, errors.New("invalid configuration JSON or unknown field")
 	}
 	if e := d.Decode(new(any)); e != io.EOF {
@@ -197,14 +201,37 @@ func decodeConfig(b []byte) (Config, error) {
 	c.raw = append([]byte(nil), b...)
 	return c, c.Validate()
 }
-func (c *Config) Validate() error {
-	if e := c.validateProviders(); e != nil {
-		return e
+func validInboundName(s string) bool {
+	if len(s) == 0 || len(s) > 64 || !utf8.ValidString(s) || strings.TrimSpace(s) != s {
+		return false
 	}
+	for _, r := range s {
+		if unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *Config) validateInboundNames() error {
+	names := map[string]bool{}
+	for i := range c.Inbounds {
+		in := &c.Inbounds[i]
+		if in.Name != "" {
+			if !validInboundName(in.Name) || names[in.Name] {
+				return fmt.Errorf("inbound %d: invalid or duplicate name", i)
+			}
+			names[in.Name] = true
+		}
+	}
+	return nil
+}
+
+func (c *Config) Validate() error {
 	if e := c.validateNetwork(); e != nil {
 		return e
 	}
-	if e := c.validateOutbounds(); e != nil {
+	if e := c.validateInboundNames(); e != nil {
 		return e
 	}
 	if e := c.validateRuntime(); e != nil {
@@ -292,19 +319,11 @@ func (c *Config) Validate() error {
 		if len(in.Users) > 1024 {
 			return errors.New("too many users")
 		}
-		if in.Protocol != "shadowsocks" && in.SS != nil || in.Protocol != "snell" && in.Snell != nil {
+		if in.Protocol != "shadowsocks" && in.SS != nil {
 			return errors.New("protocol options do not match inbound")
 		}
 		if in.Protocol != "anytls" && in.AnyTLS != nil {
 			return errors.New("AnyTLS options do not match protocol")
-		}
-		if in.Protocol != "vless" && (in.Transport != nil || in.Reality != nil) {
-			return errors.New("VLESS-only transport/security options")
-		}
-		for _, u := range in.Users {
-			if in.Protocol != "vless" && u.Flow != "" {
-				return errors.New("flow only valid for VLESS")
-			}
 		}
 		switch in.Protocol {
 		case "anytls":
@@ -336,13 +355,6 @@ func (c *Config) Validate() error {
 			if e := in.SS.validate(); e != nil {
 				return e
 			}
-		case "snell":
-			if in.TLS != nil || len(in.Users) != 0 {
-				return errors.New("Snell uses one PSK and native obfuscation only")
-			}
-			if e := in.Snell.validate(); e != nil {
-				return e
-			}
 		case "socks5":
 			if len(in.Users) == 0 && !ip.IsLoopback() {
 				return errors.New("non-loopback SOCKS5 requires users")
@@ -352,7 +364,7 @@ func (c *Config) Validate() error {
 			}
 			seen := map[string]bool{}
 			for _, u := range in.Users {
-				if len(u.Username) < 1 || len(u.Username) > 255 || len(u.Password) < 1 || len(u.Password) > 255 || u.UUID != "" || seen[u.Username] {
+				if len(u.Username) < 1 || len(u.Username) > 255 || len(u.Password) < 1 || len(u.Password) > 255 || seen[u.Username] {
 					return errors.New("invalid or duplicate SOCKS5 user")
 				}
 				seen[u.Username] = true
@@ -363,104 +375,19 @@ func (c *Config) Validate() error {
 			}
 			seen := map[string]bool{}
 			for _, u := range in.Users {
-				if u.Password == "" || len(u.Password) > 4096 || u.Username != "" || u.UUID != "" || seen[u.Password] {
+				if u.Password == "" || len(u.Password) > 4096 || u.Username != "" || seen[u.Password] {
 					return errors.New("invalid or duplicate Trojan credential")
 				}
 				seen[u.Password] = true
 			}
-		case "vless":
-			if len(in.Users) == 0 {
-				return errors.New("VLESS requires UUID users")
-			}
-			if in.TLS == nil && in.Reality == nil && !ip.IsLoopback() && !in.AllowInsecure {
-				return errors.New("non-loopback plaintext VLESS requires explicit allow_insecure")
-			}
-			if in.TLS != nil && in.Reality != nil {
-				return errors.New("TLS and REALITY are mutually exclusive")
-			}
-			if in.Reality != nil {
-				if _, e := in.Reality.config(*l); e != nil {
-					return e
-				}
-			}
-			if in.Transport != nil {
-				if (in.Transport.Type == "grpc" || in.Transport.Type == "xhttp") && in.TLS == nil {
-					return errors.New("gRPC requires actual TLS/h2; h2c unsupported")
-				}
-				if in.Reality != nil {
-					return errors.New("REALITY only supports RAW in this core")
-				}
-				if in.Transport.MaxStreams == 0 {
-					in.Transport.MaxStreams = 16
-				}
-				if in.Transport.MaxStreams < 1 || in.Transport.MaxStreams > l.LogicalStreams {
-					return errors.New("invalid transport stream quota")
-				}
-				if in.Transport.Type == "xhttp" {
-					if in.Transport.MaxEarlyData != 0 || in.Transport.ServiceName != "" {
-						return errors.New("XHTTP only default placement; no WS ED/grpc service")
-					}
-					if in.Transport.XHTTP == nil {
-						in.Transport.XHTTP = &XHTTPOptions{}
-					}
-					if e := in.Transport.XHTTP.validate(in.Transport, *l); e != nil {
-						return e
-					}
-				} else if in.Transport.XHTTP != nil {
-					return errors.New("XHTTP options require xhttp type")
-				} else if _, e := VT.NewServer(in.Transport.config(*l)); e != nil {
-					return errors.New("invalid VLESS transport endpoint")
-				}
-			}
-			seen := map[[16]byte]bool{}
-			for _, u := range in.Users {
-				if u.Flow != "" && u.Flow != VX.VisionFlow {
-					return errors.New("unsupported VLESS flow")
-				}
-				if u.Flow != "" && (in.Transport != nil || (in.TLS == nil && in.Reality == nil)) {
-					return errors.New("Vision requires RAW TLS1.3 or local REALITY")
-				}
-				v, e := parseUUID(u.UUID)
-				if e != nil || u.Password != "" || u.Username != "" || seen[v] {
-					return errors.New("invalid or duplicate VLESS UUID")
-				}
-				seen[v] = true
-			}
+		case "vless", "snell", "http":
+			return fmt.Errorf("inbound protocol %q is not supported in Kat-Server (supported: shadowsocks, anytls, trojan, socks5)", in.Protocol)
 		default:
 			return errors.New("unsupported inbound protocol")
 		}
 		if in.TLS != nil && (in.Protocol == "trojan" || in.Protocol == "anytls") {
 			if e := in.validateServerTLS(); e != nil {
 				return e
-			}
-		} else if in.TLS != nil {
-			if in.TLS.extended() {
-				return errors.New("extended TLS options apply to Trojan and AnyTLS inbounds only")
-			}
-			cert, e := tls.LoadX509KeyPair(in.TLS.Cert, in.TLS.Key)
-			if e != nil {
-				return errors.New("cannot load TLS certificate/key")
-			}
-			in.tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
-			in.ephemeralTLS = false
-			if in.Protocol == "vless" {
-				for _, u := range in.Users {
-					if u.Flow == VX.VisionFlow {
-						in.tlsConfig.MinVersion = tls.VersionTLS13
-					}
-				}
-				if in.Transport != nil {
-					if in.Transport.Type == "xhttp" {
-						in.tlsConfig.NextProtos = []string{"h2", "http/1.1"}
-						if len(in.Transport.XHTTP.ALPN) > 0 {
-							in.tlsConfig.NextProtos = append([]string(nil), in.Transport.XHTTP.ALPN...)
-						}
-					} else if in.Transport.Type == "grpc" {
-						in.tlsConfig.NextProtos = []string{"h2"}
-					} else {
-						in.tlsConfig.NextProtos = []string{"http/1.1"}
-					}
-				}
 			}
 		} else if in.Protocol == "anytls" && !in.ephemeralTLS {
 			// One certificate per loaded configuration: Start re-validating
@@ -477,7 +404,6 @@ func (c *Config) Validate() error {
 	}
 	seenAny := map[string]AnyTLSOptions{}
 	seenSS := map[string]SSOptions{}
-	seenSn := map[string]SnellOptions{}
 	for _, in := range c.Inbounds {
 		if in.AnyTLS != nil {
 			if old, ok := seenAny[in.AnyTLS.Password]; ok && old != *in.AnyTLS {
@@ -491,12 +417,6 @@ func (c *Config) Validate() error {
 				return errors.New("same SS identity has conflicting settings")
 			}
 			seenSS[id] = *in.SS
-		}
-		if in.Snell != nil {
-			if prev, ok := seenSn[in.Snell.PSK]; ok && (prev.Obfs != in.Snell.Obfs || prev.ReplayCapacity != in.Snell.ReplayCapacity || prev.MaxRequests != in.Snell.MaxRequests) {
-				return errors.New("same Snell PSK requires same obfs/protection settings")
-			}
-			seenSn[in.Snell.PSK] = *in.Snell
 		}
 	}
 	totalAnyWorkers := 0
@@ -514,15 +434,4 @@ func (c *Config) Validate() error {
 		return errors.New("AnyTLS identity worker budgets exceed logical_streams; allocate explicit bounded identity quotas")
 	}
 	return nil
-}
-func parseUUID(s string) (v [16]byte, e error) {
-	if len(s) != 36 || s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-' {
-		return v, errors.New("UUID must be canonical")
-	}
-	b, e := hex.DecodeString(s[:8] + s[9:13] + s[14:18] + s[19:23] + s[24:])
-	if e != nil {
-		return v, errors.New("invalid UUID")
-	}
-	copy(v[:], b)
-	return v, nil
 }
