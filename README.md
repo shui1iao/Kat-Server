@@ -1,10 +1,10 @@
-# Kat-Server v0.8.1
+# Kat-Server v0.8.2
 
 本版变更、默认值变化及测试边界以[发布说明](RELEASE_NOTES.md)为准。以下功能文档继承原服务端；命令及模块路径不改。
 
 # Kat
 
-Kat 是用 Go 编写的 Linux 纯正式入站+直连转发服务端代理内核，提供有界资源管理与 TCP/UDP 直连转发。当前版本 **0.8.1**，在 0.7.0 基础上修复 AnyTLS 旧会话授权撤销与 API/统计热重载原子性，并增加 AnyTLS 入站自定义 padding 方案；既有功能、默认值和正式协议范围不变。命令名为 `kat`，模块名为 `github.com/shui1iao/Kat`。本项目不提供图形客户端、TUN 或公网管理接口；本机管理接口只监听 Unix socket 或回环地址。升级变化及限制见 [发布说明](RELEASE_NOTES.md)。
+Kat 是用 Go 编写的 Linux 纯正式入站+直连转发服务端代理内核，提供有界资源管理与 TCP/UDP 直连转发。当前版本 **0.8.2**，在 0.7.0 基础上修复 AnyTLS 旧会话授权撤销与 API/统计热重载原子性，并增加 AnyTLS 入站自定义 padding 方案；既有功能、默认值和正式协议范围不变。命令名为 `kat`，模块名为 `github.com/shui1iao/Kat`。本项目不提供图形客户端、TUN 或公网管理接口；本机管理接口只监听 Unix socket 或回环地址。升级变化及限制见 [发布说明](RELEASE_NOTES.md)。
 
 ## 入站协议范围
 
@@ -36,7 +36,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -o kat 
 ./kat run examples/socks5.json
 ```
 
-`version` 输出 `kat 0.8.1`。`check` 严格检查 JSON、未知字段、凭据组合、限额及 TLS 证书/私钥配对（AnyTLS 入站省略 `tls` 时，`check` 同样会在内存中生成一张随机证书，与之后 `run` 使用的不是同一张），但不建立监听、不联网。`run` 启动服务；收到 SIGINT/SIGTERM 后停止接入，在 `drain_timeout` 内等待，超时取消并回收。
+`version` 输出 `kat 0.8.2`。`check` 严格检查 JSON、未知字段、凭据组合、限额及 TLS 证书/私钥配对（AnyTLS 入站省略 `tls` 时，`check` 同样会在内存中生成一张随机证书，与之后 `run` 使用的不是同一张），但不建立监听、不联网。`run` 启动服务；收到 SIGINT/SIGTERM 后停止接入，在 `drain_timeout` 内等待，超时取消并回收。
 
 0.7.0 起另有管理子命令，用于查看和操作正在运行的实例，详见下文“日志、流量统计与管理接口”：
 
@@ -52,12 +52,12 @@ kat log level [debug|info|warn|error]  # 查看或切换日志级别
 
 首次构建需要准备 `go.mod`/`go.sum` 指定的依赖；依赖齐全后可以使用 `GOTOOLCHAIN=local GOPROXY=off GOFLAGS=-mod=readonly` 离线构建。源码未内置全部依赖缓存。
 
-[v0.8.1 Release](https://github.com/shui1iao/Kat-Server/releases/tag/v0.8.1) 提供 [kat-0.8.1-linux-amd64](https://github.com/shui1iao/Kat-Server/releases/download/v0.8.1/kat-0.8.1-linux-amd64)、对应 [.sha256](https://github.com/shui1iao/Kat-Server/releases/download/v0.8.1/kat-0.8.1-linux-amd64.sha256) 及 [kat-0.8.1-third-party-licenses.txt](https://github.com/shui1iao/Kat-Server/releases/download/v0.8.1/kat-0.8.1-third-party-licenses.txt) 许可附件。可先校验，再改为便于调用的名称：
+[v0.8.2 Release](https://github.com/shui1iao/Kat-Server/releases/tag/v0.8.2) 提供 [kat-0.8.2-linux-amd64](https://github.com/shui1iao/Kat-Server/releases/download/v0.8.2/kat-0.8.2-linux-amd64)、对应 [.sha256](https://github.com/shui1iao/Kat-Server/releases/download/v0.8.2/kat-0.8.2-linux-amd64.sha256) 及 [kat-0.8.2-third-party-licenses.txt](https://github.com/shui1iao/Kat-Server/releases/download/v0.8.2/kat-0.8.2-third-party-licenses.txt) 许可附件。可先校验，再改为便于调用的名称：
 
 ```sh
-sha256sum -c kat-0.8.1-linux-amd64.sha256
-chmod +x kat-0.8.1-linux-amd64
-./kat-0.8.1-linux-amd64 version
+sha256sum -c kat-0.8.2-linux-amd64.sha256
+chmod +x kat-0.8.2-linux-amd64
+./kat-0.8.2-linux-amd64 version
 ```
 
 ## 配置与示例
@@ -362,4 +362,4 @@ UDP 分片重组默认开启：每关联缓存载荷最多 65535 字节，全局
 
 - Go 标准库与 `golang.org/x/crypto`、`golang.org/x/net`、`golang.org/x/sys` 适用 BSD-3-Clause（附 PATENTS）。
 - `lukechampine.com/blake3` 与 `github.com/klauspost/cpuid/v2` 适用 MIT。
-- 原始许可与专利文本保留于 `third_party/licenses/` 及 [第三方说明](THIRD_PARTY_NOTICES.md)；随二进制分发的 `kat-0.8.1-third-party-licenses.txt` 附件汇总全部适用第三方许可原文。
+- 原始许可与专利文本保留于 `third_party/licenses/` 及 [第三方说明](THIRD_PARTY_NOTICES.md)；随二进制分发的 `kat-0.8.2-third-party-licenses.txt` 附件汇总全部适用第三方许可原文。
