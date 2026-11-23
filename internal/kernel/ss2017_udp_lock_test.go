@@ -56,7 +56,7 @@ func TestSS2017ReplySocketWaitDoesNotBlockRouting(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer socket.Close()
-	rt := &ssRuntime{codec: codec}
+	rt := &ssRuntime{codec: codec, ssRoutes: &ssRoutes{}}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	s := &Server{}

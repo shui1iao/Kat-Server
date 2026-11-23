@@ -112,16 +112,15 @@ type Server struct {
 	udpX      cipher.AEAD
 }
 
-func NewServer(c Config) (*Server, error) {
-	m, err := lookup(c.Method)
-	if err != nil {
-		return nil, err
-	}
-	if len(c.Key) != m.keySize {
-		return nil, fmt.Errorf("%w: %s needs %d raw bytes", ErrKey, c.Method, m.keySize)
-	}
+// ProtectionLimits is a validated, immutable admission policy; zero is invalid.
+type ProtectionLimits struct {
+	tcp, old, sessions int
+	idle               time.Duration
+}
+
+func (c Config) ProtectionLimits() (ProtectionLimits, error) {
 	if c.MaxTCPSalts < 0 || c.MaxUDPSessions < 0 || c.Max2017Salts < 0 || c.Max2017Salts > default2017Salts {
-		return nil, fmt.Errorf("%w: negative capacity", ErrCapacity)
+		return ProtectionLimits{}, fmt.Errorf("%w: negative capacity", ErrCapacity)
 	}
 	if c.MaxTCPSalts == 0 {
 		c.MaxTCPSalts = 65536
@@ -132,16 +131,45 @@ func NewServer(c Config) (*Server, error) {
 	if c.Max2017Salts == 0 {
 		c.Max2017Salts = default2017Salts
 	}
-	s := &Server{m: m, key: append([]byte(nil), c.Key...), user: c.UserID, now: time.Now, random: rand.Reader}
-	s.tcpSalts.init(c.MaxTCPSalts)
-	s.oldSalts.init(c.Max2017Salts)
-	s.udp.init(c.MaxUDPSessions)
 	if c.UDPIdle < 0 || c.UDPIdle > 24*time.Hour {
-		return nil, errors.New("ss: invalid UDP idle")
+		return ProtectionLimits{}, errors.New("ss: invalid UDP idle")
 	}
-	if c.UDPIdle > s.udp.idle {
-		s.udp.idle = c.UDPIdle
+	return ProtectionLimits{c.MaxTCPSalts, c.Max2017Salts, c.MaxUDPSessions, max(replayTTL, c.UDPIdle)}, nil
+}
+
+// ApplyProtection publishes prevalidated limits without replacing the key's
+// replay windows, capabilities or nonce counters. Lower capacities stop new
+// admissions while over budget; no live item is evicted to satisfy the limit.
+func (s *Server) ApplyProtection(p ProtectionLimits) {
+	if p.idle < replayTTL {
+		panic("ss: uninitialized protection policy")
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tcpSalts.capacity, s.oldSalts.capacity, s.udp.capacity = p.tcp, p.old, p.sessions
+	// An existing relay is still owned by its admitting generation. Keep
+	// its codec retention floor through that session's lifetime; new sessions
+	// take the new idle. No heap rebuild or resurrection on policy changes.
+	s.udp.idle = p.idle
+}
+
+func NewServer(c Config) (*Server, error) {
+	m, err := lookup(c.Method)
+	if err != nil {
+		return nil, err
+	}
+	if len(c.Key) != m.keySize {
+		return nil, fmt.Errorf("%w: %s needs %d raw bytes", ErrKey, c.Method, m.keySize)
+	}
+	limits, err := c.ProtectionLimits()
+	if err != nil {
+		return nil, err
+	}
+	s := &Server{m: m, key: append([]byte(nil), c.Key...), user: c.UserID, now: time.Now, random: rand.Reader}
+	s.tcpSalts.init(limits.tcp)
+	s.oldSalts.init(limits.old)
+	s.udp.init(limits.sessions)
+	s.udp.idle = limits.idle
 	if m.v2022 {
 		if m.chacha {
 			if s.udpX, err = chacha20poly1305.NewX(s.key); err != nil {

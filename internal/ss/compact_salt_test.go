@@ -44,7 +44,7 @@ func TestCompactExactExpiryCapacity(t *testing.T) {
 			for _, p := range c.pages {
 				if p != nil {
 					for _, e := range p.data {
-						if e != (compactEntry{}) {
+						if e != (compactEntry{order: e.order}) { // only free-list metadata may remain
 							t.Fatal("expired slot not cleared")
 						}
 					}

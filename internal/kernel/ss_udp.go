@@ -17,10 +17,14 @@ type ssAssociationID struct {
 	session uint64
 }
 type ssRuntime struct {
-	codec        *ss.Server
-	conf         ss.Config // for reuse by a reload with identical settings
-	v2022        bool
-	mu           sync.Mutex // serializes authenticated migration and reply destination selection
+	codec     *ss.Server
+	identity  string
+	limits    ss.ProtectionLimits // immutable policy staged by this generation
+	v2022     bool
+	*ssRoutes // shared across generations for the same identity
+}
+type ssRoutes struct {
+	mu           sync.Mutex
 	associations map[ssAssociationID]*ssNativeAssociation
 }
 
@@ -139,14 +143,18 @@ func (k *core) readSSUDP(l *ssUDPListener) {
 			continue
 		}
 		rt := b.runtime
-		// Header parsing and AEAD authentication run outside the routing lock for
-		// both SS2017 and SIP022. The codec itself atomically checks+commits the
-		// replay window, session creation and authenticated-peer migration under
-		// its own mutex, only after authentication. Since 0.5.20 the SIP022
-		// association capability/listener update below is no longer serialized
-		// with that codec commit (approved trade-off: concurrent readers may
-		// briefly leave an older listener selected after migration).
-		p, e := rt.codec.DecodeUDP(wire[:n], source)
+		var p *ss.Packet
+		if rt.v2022 {
+			var refused bool
+			p, e, refused = k.decodeSS2022OnBinding(l, b, wire[:n], source)
+			if refused {
+				s.handSlots.release()
+				s.counters.Dropped.Add(1)
+				continue
+			}
+		} else {
+			p, e = rt.codec.DecodeUDP(wire[:n], source)
+		}
 		s.handSlots.release()
 		if e != nil {
 			s.counters.Dropped.Add(1)
@@ -172,7 +180,7 @@ func (k *core) readSSUDP(l *ssUDPListener) {
 		if assoc == nil {
 			// A new association belongs to the generation bound right now; a
 			// removed (draining) socket accepts no new association.
-			if s.udpSourceRefused(source.Addr(), logIndex) {
+			if !rt.v2022 && s.udpSourceRefused(source.Addr(), logIndex) {
 				rt.mu.Unlock()
 				s.counters.Dropped.Add(1)
 				continue
@@ -227,6 +235,39 @@ func (k *core) readSSUDP(l *ssUDPListener) {
 		rt.mu.Unlock()
 	}
 }
+
+// A live binding authorizes peer migration under its current ACL. Holding
+// bindMu through authentication/commit linearizes that decision with reload.
+// The steady state does not take the association lock during authentication.
+func (k *core) decodeSS2022OnBinding(l *ssUDPListener, b *udpBinding, wire []byte, source netip.AddrPort) (*ss.Packet, error, bool) {
+	draining := l.draining.Load()
+	rt := b.runtime
+	if draining {
+		// Removed listeners have no current ACL grant for a migration. Only
+		// their existing association/peer may drain. Lock order is the same
+		// as new-association admission: routes -> binding -> codec.
+		rt.mu.Lock()
+		defer rt.mu.Unlock()
+	}
+	k.bindMu.RLock()
+	defer k.bindMu.RUnlock()
+	if l.bind.Load() != b || draining != l.draining.Load() || b.g.udpSourceRefused(source.Addr(), b.idx) {
+		return nil, nil, true
+	}
+	if draining {
+		p, err := rt.codec.DecodeEstablishedUDP(wire, source, func(id uint64) *ss.Packet {
+			n := rt.associations[ssAssociationID{session: id}]
+			if n == nil || n.listener != l || n.a.ctx.Err() != nil || n.a.ssIdleExpired(time.Now()) {
+				return nil
+			}
+			return n.capability
+		})
+		return p, err, false
+	}
+	p, err := rt.codec.DecodeUDP(wire, source)
+	return p, err, false
+}
+
 func (a *udpAssociation) openOutbound() error {
 	var e error
 	s := a.server

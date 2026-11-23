@@ -1,6 +1,7 @@
 package kernel
 
 import (
+	"container/heap"
 	"errors"
 	"fmt"
 	"net"
@@ -232,12 +233,49 @@ func parseBanKey(s string) (netip.Addr, bool) {
 	return guardKey(ip), true
 }
 
+// Keep only one expiry record per tracked key. The failure queue is sorted
+// by window start, so changing a configured window needs no table rebuild.
+// Ban durations can differ across reloads: order their absolute expiration.
+const guardSweepBatch = 128
+
+type guardExpiry struct {
+	key   netip.Addr
+	at    time.Time
+	index int
+}
+type guardQueue []*guardExpiry
+
+func (q guardQueue) Len() int           { return len(q) }
+func (q guardQueue) Less(i, j int) bool { return q[i].at.Before(q[j].at) }
+func (q guardQueue) Swap(i, j int)      { q[i], q[j] = q[j], q[i]; q[i].index = i; q[j].index = j }
+func (q *guardQueue) Push(x any)        { n := x.(*guardExpiry); n.index = len(*q); *q = append(*q, n) }
+func (q *guardQueue) Pop() any {
+	v := *q
+	i := len(v) - 1
+	n := v[i]
+	v[i] = nil
+	*q = v[:i]
+	n.index = -1
+	return n
+}
+func (q *guardQueue) set(n *guardExpiry, key netip.Addr, at time.Time) {
+	n.key = key
+	n.at = at
+	if n.index < 0 {
+		heap.Push(q, n)
+	} else {
+		heap.Fix(q, n.index)
+	}
+}
+
 type failWindow struct {
-	start time.Time
-	count int
+	expiry guardExpiry
+	start  time.Time
+	count  int
 }
 
 type banEntry struct {
+	expiry       guardExpiry
 	since, until time.Time
 	failures     int
 	protocol     string
@@ -245,13 +283,14 @@ type banEntry struct {
 
 // sourceGuard is the process-wide ban table and per-source connection count.
 type sourceGuard struct {
-	k      *core
-	mu     sync.Mutex
-	fails  map[netip.Addr]*failWindow
-	bans   map[netip.Addr]*banEntry
-	conns  map[netip.Addr]int
-	timer  *time.Timer // sweeps expired entries while any exist
-	closed bool
+	k                     *core
+	mu                    sync.Mutex
+	fails                 map[netip.Addr]*failWindow
+	bans                  map[netip.Addr]*banEntry
+	failExpiry, banExpiry guardQueue
+	conns                 map[netip.Addr]int
+	timer                 *time.Timer // sweeps expired entries while any exist
+	closed                bool
 
 	nbans atomic.Int64 // len(bans): the accept path skips the lock at 0
 
@@ -334,17 +373,15 @@ func (g *sourceGuard) authFailure(ip netip.Addr, o *AuthBanOptions, protocol str
 	if w == nil || now.Sub(w.start) >= o.Window.value() {
 		if w == nil {
 			if len(g.fails) >= maxTrackedSources {
-				g.sweepLocked(now)
-			}
-			if len(g.fails) >= maxTrackedSources {
 				g.mu.Unlock()
 				g.untracked.Add(1)
 				return
 			}
-			w = &failWindow{}
+			w = &failWindow{expiry: guardExpiry{index: -1}}
 			g.fails[key] = w
 		}
 		w.start, w.count = now, 0
+		g.failExpiry.set(&w.expiry, key, now)
 	}
 	w.count++
 	if w.count < o.Threshold {
@@ -352,19 +389,21 @@ func (g *sourceGuard) authFailure(ip netip.Addr, o *AuthBanOptions, protocol str
 		g.mu.Unlock()
 		return
 	}
+	heap.Remove(&g.failExpiry, w.expiry.index)
 	delete(g.fails, key)
-	if len(g.bans) >= maxBannedSources {
-		g.sweepLocked(now)
-	}
-	if len(g.bans) >= maxBannedSources {
-		g.mu.Unlock()
-		g.untracked.Add(1)
-		return
-	}
-	if _, ok := g.bans[key]; !ok {
+	b := g.bans[key]
+	if b == nil {
+		if len(g.bans) >= maxBannedSources {
+			g.mu.Unlock()
+			g.untracked.Add(1)
+			return
+		}
+		b = &banEntry{expiry: guardExpiry{index: -1}}
+		g.bans[key] = b
 		g.nbans.Add(1)
 	}
-	g.bans[key] = &banEntry{since: now, until: now.Add(o.Duration.value()), failures: w.count, protocol: protocol}
+	b.since, b.until, b.failures, b.protocol = now, now.Add(o.Duration.value()), w.count, protocol
+	g.banExpiry.set(&b.expiry, key, b.until)
 	g.bansTotal.Add(1)
 	g.armLocked()
 	g.mu.Unlock()
@@ -375,7 +414,11 @@ func (g *sourceGuard) authFailure(ip netip.Addr, o *AuthBanOptions, protocol str
 // armLocked starts the sweep timer when entries exist and it is not running.
 func (g *sourceGuard) armLocked() {
 	if g.timer == nil && !g.closed && (len(g.fails) > 0 || len(g.bans) > 0) {
-		g.timer = time.AfterFunc(guardSweepInterval, g.sweep)
+		delay := guardSweepInterval
+		if g.moreExpiredLocked(time.Now()) {
+			delay = time.Millisecond
+		}
+		g.timer = time.AfterFunc(delay, g.sweep)
 	}
 }
 
@@ -390,27 +433,31 @@ func (g *sourceGuard) sweep() {
 	}
 }
 
-// sweepLocked drops expired bans and failure windows (window lengths are
-// those of the current configuration).
-func (g *sourceGuard) sweepLocked(now time.Time) []netip.Addr {
-	var expired []netip.Addr
-	for k, b := range g.bans {
-		if !now.Before(b.until) {
-			delete(g.bans, k)
-			g.nbans.Add(-1)
-			expired = append(expired, k)
-		}
-	}
-	window := defaultBanWindow
+func (g *sourceGuard) windowLocked() time.Duration {
 	if cur := g.k.gen.Load(); cur != nil {
 		if o := cur.cfg.authBan(); o != nil {
-			window = o.Window.value()
+			return o.Window.value()
 		}
 	}
-	for k, w := range g.fails {
-		if now.Sub(w.start) >= window {
-			delete(g.fails, k)
-		}
+	return defaultBanWindow
+}
+func (g *sourceGuard) moreExpiredLocked(now time.Time) bool {
+	return len(g.banExpiry) > 0 && !now.Before(g.banExpiry[0].at) || len(g.failExpiry) > 0 && now.Sub(g.failExpiry[0].at) >= g.windowLocked()
+}
+
+// Release the shared lock between bounded batches, even after long pauses.
+func (g *sourceGuard) sweepLocked(now time.Time) []netip.Addr {
+	var expired []netip.Addr
+	for len(expired) < guardSweepBatch && len(g.banExpiry) > 0 && !now.Before(g.banExpiry[0].at) {
+		n := heap.Pop(&g.banExpiry).(*guardExpiry)
+		delete(g.bans, n.key)
+		g.nbans.Add(-1)
+		expired = append(expired, n.key)
+	}
+	window := g.windowLocked()
+	for i := 0; i < guardSweepBatch && len(g.failExpiry) > 0 && now.Sub(g.failExpiry[0].at) >= window; i++ {
+		n := heap.Pop(&g.failExpiry).(*guardExpiry)
+		delete(g.fails, n.key)
 	}
 	return expired
 }
@@ -425,6 +472,7 @@ func (g *sourceGuard) configure(c *Config) {
 	n := len(g.bans)
 	clear(g.bans)
 	clear(g.fails)
+	g.failExpiry, g.banExpiry = nil, nil
 	g.nbans.Store(0)
 	g.mu.Unlock()
 	if n > 0 {
@@ -476,10 +524,14 @@ func (g *sourceGuard) remove(source string) (bool, error) {
 	b := g.bans[key]
 	found := b != nil && now.Before(b.until)
 	if b != nil {
+		heap.Remove(&g.banExpiry, b.expiry.index)
 		delete(g.bans, key)
 		g.nbans.Add(-1)
 	}
-	delete(g.fails, key)
+	if w := g.fails[key]; w != nil {
+		heap.Remove(&g.failExpiry, w.expiry.index)
+		delete(g.fails, key)
+	}
 	g.mu.Unlock()
 	if found {
 		g.k.notice(levelInfo, "kat event=source_ban_removed source="+truncateSource(key))

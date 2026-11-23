@@ -7,6 +7,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -18,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -144,7 +146,13 @@ func NewManager(o Options, h Hooks) (*Manager, error) {
 }
 
 func (m *Manager) certDir() string {
-	return filepath.Join(m.dir, "certificates", sanitize(strings.ReplaceAll(m.o.Domains[0], "*", "_wildcard_")))
+	names := slices.Clone(m.o.Domains)
+	slices.Sort(names)
+	id := sha256.Sum256([]byte(strings.Join(names, "\x00")))
+	return filepath.Join(m.dir, "certificates", "v2", fmt.Sprintf("%x", id))
+}
+func (m *Manager) legacyCertDir(domain string) string {
+	return filepath.Join(m.dir, "certificates", sanitize(strings.ReplaceAll(domain, "*", "_wildcard_")))
 }
 
 func (m *Manager) domainsList() string { return strings.Join(m.o.Domains, ",") }
@@ -162,9 +170,25 @@ func (m *Manager) covers(leaf *x509.Certificate) bool {
 // loadStored returns the stored certificate when it covers all domains and
 // has not expired.
 func (m *Manager) loadStored() *tls.Certificate {
-	dir := m.certDir()
-	c, _, e := LoadPair(filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem"))
-	if e != nil || !m.covers(c.Leaf) || Now().After(c.Leaf.NotAfter) {
+	// A single self-contained PEM is one credentials generation. Read it once:
+	// two opens of the same pathname could see different generations.
+	b, err := ReadFileLimited(filepath.Join(m.certDir(), "pair.pem"))
+	var c *tls.Certificate
+	if err == nil {
+		c, err = ParsePair(b, b)
+	} else if errors.Is(err, os.ErrNotExist) {
+		// Older versions stored by their first configured SAN. A reordered
+		// domain set should still be able to reuse the old valid certificate.
+		for _, domain := range m.o.Domains {
+			dir := m.legacyCertDir(domain)
+			old, _, e := LoadPair(filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem"))
+			if e == nil && len(old.Leaf.DNSNames) == len(m.o.Domains) && m.covers(old.Leaf) {
+				return old
+			}
+		}
+		return nil
+	}
+	if err != nil || validAt(c, Now()) != nil || !m.covers(c.Leaf) {
 		return nil
 	}
 	return c
@@ -313,8 +337,17 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	}
 	if e != nil {
 		os.Remove(tmp)
+		return e
 	}
-	return e
+	if runtime.GOOS != "windows" {
+		d, err := os.Open(filepath.Dir(path))
+		if err != nil {
+			return err
+		}
+		defer d.Close()
+		return d.Sync()
+	}
+	return nil
 }
 
 func marshalKey(k crypto.Signer) ([]byte, error) {
@@ -476,15 +509,22 @@ func (m *Manager) obtain(parent context.Context) (*tls.Certificate, error) {
 	if e != nil {
 		return nil, e
 	}
+	return m.storePair(chain, kb)
+}
+
+func (m *Manager) storePair(chain, kb []byte) (*tls.Certificate, error) {
+	if len(chain)+len(kb) > maxFileBytes {
+		return nil, errors.New("issued certificate bundle exceeds size limit")
+	}
 	cert, e := ParsePair(chain, kb)
-	if e != nil || !m.covers(cert.Leaf) {
-		return nil, errors.New("issued certificate does not match the order")
+	if e != nil || validAt(cert, Now()) != nil || !m.covers(cert.Leaf) {
+		return nil, errors.New("issued certificate does not match the order or its validity period")
 	}
-	dir := m.certDir()
-	if e := writeFileAtomic(filepath.Join(dir, "key.pem"), kb, 0o600); e != nil {
-		return nil, fmt.Errorf("cannot store certificate: %w", e)
-	}
-	if e := writeFileAtomic(filepath.Join(dir, "cert.pem"), chain, 0o600); e != nil {
+	bundle := make([]byte, 0, len(chain)+len(kb))
+	bundle = append(bundle, chain...)
+	bundle = append(bundle, kb...)
+	defer clear(bundle)
+	if e := writeFileAtomic(filepath.Join(m.certDir(), "pair.pem"), bundle, 0600); e != nil {
 		return nil, fmt.Errorf("cannot store certificate: %w", e)
 	}
 	return cert, nil
@@ -532,14 +572,15 @@ func (m *Manager) present(ctx context.Context, c *acme.Client, domain string, ch
 			return nil, e
 		}
 		if m.o.Webroot != "" {
-			file := filepath.Join(m.o.Webroot, filepath.FromSlash(strings.TrimPrefix(path, "/")))
-			if e := os.MkdirAll(filepath.Dir(file), 0o755); e != nil {
-				return nil, e
+			clean, err := writeChallenge(m.o.Webroot, chal.Token, body)
+			if err != nil {
+				return nil, err
 			}
-			if e := os.WriteFile(file, []byte(body), 0o644); e != nil {
-				return nil, e
-			}
-			return func() { os.Remove(file) }, nil
+			return func() {
+				if err := clean(); err != nil {
+					m.h.Log("warn", "kat event=acme_webroot_cleanup_failed reason="+token(err.Error(), 180))
+				}
+			}, nil
 		}
 		r, e := acquireHTTP(m.o.HTTPListen)
 		if e != nil {

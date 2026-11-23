@@ -37,6 +37,19 @@ func (p *Packet) AuthenticatedAt() time.Time { return p.receivedAt }
 // A session is keyed by this Server's key + protocol client-session-ID, not source.
 // Source must identify an already received datagram; no DNS/network I/O occurs.
 func (s *Server) DecodeUDP(wire []byte, source netip.AddrPort) (*Packet, error) {
+	return s.decodeUDP(wire, source, nil)
+}
+
+// DecodeEstablishedUDP is for a draining SIP022 listener, which no longer has
+// authority to accept a new peer. Existing must be a nonblocking lookup of a
+// capability already held by that listener; it must not call back into Server.
+func (s *Server) DecodeEstablishedUDP(wire []byte, source netip.AddrPort, existing func(uint64) *Packet) (*Packet, error) {
+	if !s.m.v2022 || existing == nil {
+		return nil, ErrSessionExpired
+	}
+	return s.decodeUDP(wire, source, existing)
+}
+func (s *Server) decodeUDP(wire []byte, source netip.AddrPort, existing func(uint64) *Packet) (*Packet, error) {
 	if len(wire) > MaxUDPPacketSize || !source.IsValid() {
 		return nil, ErrFormat
 	}
@@ -114,7 +127,20 @@ func (s *Server) DecodeUDP(wire []byte, source netip.AddrPort) (*Packet, error) 
 	}
 	s.udp.expire(now)
 	session := s.udp.entries[clientID]
+	if existing != nil {
+		if session == nil || session.peer != source {
+			return nil, ErrSessionExpired
+		}
+		p := existing(clientID)
+		if p == nil || p.owner != s || p.session != session {
+			return nil, ErrSessionExpired
+		}
+	}
 	if session == nil {
+		// Both AES directions derive the same key from a session ID.
+		if !s.m.chacha && s.udp.serverIDs[clientID] {
+			return nil, ErrReplay
+		}
 		if len(s.udp.entries) >= s.udp.capacity {
 			return nil, ErrCapacity
 		}
@@ -128,7 +154,7 @@ func (s *Server) DecodeUDP(wire []byte, source netip.AddrPort) (*Packet, error) 
 				return nil, e
 			}
 			v := binary.BigEndian.Uint64(id)
-			if v != clientID && !s.udp.serverIDs[v] {
+			if v != clientID && !s.udp.serverIDs[v] && (s.m.chacha || s.udp.entries[v] == nil) {
 				session.serverID = v
 				found = true
 				break
@@ -147,7 +173,8 @@ func (s *Server) DecodeUDP(wire []byte, source netip.AddrPort) (*Packet, error) 
 		}
 		session.window.accept(packetID)
 		session.peer = source
-		session.expires = now.Add(s.udp.idle)
+		session.idleFloor = s.udp.idle
+		session.expires = now.Add(session.idleFloor)
 		s.udp.entries[clientID] = session
 		s.udp.serverIDs[session.serverID] = true
 		heap.Push(&s.udp.queue, session)

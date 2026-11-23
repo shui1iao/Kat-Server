@@ -173,9 +173,18 @@ func TestStorageNames(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	if !strings.HasSuffix(m.certDir(), filepath.Join("acme-v02.api.letsencrypt.org-directory", "certificates", "_wildcard_.a.example")) {
-		t.Fatal(m.certDir())
+	other := m.o
+	other.Domains = []string{"a.example", "*.a.example"}
+	rev, _ := NewManager(other, Hooks{})
+	if len(filepath.Base(m.certDir())) != 64 || m.certDir() != rev.certDir() {
+		t.Fatal("storage identity not stable for reordered SANs")
 	}
+	other.Domains = []string{"*.a.example"}
+	single, _ := NewManager(other, Hooks{})
+	if m.certDir() == single.certDir() {
+		t.Fatal("same first domain, different SAN set collided")
+	}
+
 	if m.Certificate() != nil {
 		t.Fatal("certificate without storage")
 	}
@@ -189,9 +198,10 @@ func TestManagerLoadsStoredCertificate(t *testing.T) {
 	o := Options{Domains: []string{"a.example"}, Storage: dir, Directory: "https://ca.example/dir", Challenge: ChallengeTLSALPN01}
 	m, _ := NewManager(o, Hooks{})
 	c, k := pemPair(t, 7, time.Now().Add(time.Hour), "a.example")
-	os.MkdirAll(m.certDir(), 0o700)
-	os.WriteFile(filepath.Join(m.certDir(), "cert.pem"), c, 0o600)
-	os.WriteFile(filepath.Join(m.certDir(), "key.pem"), k, 0o600)
+	legacy := m.legacyCertDir("a.example")
+	os.MkdirAll(legacy, 0o700)
+	os.WriteFile(filepath.Join(legacy, "cert.pem"), c, 0o600)
+	os.WriteFile(filepath.Join(legacy, "key.pem"), k, 0o600)
 	m2, _ := NewManager(o, Hooks{})
 	if m2.Certificate() == nil || m2.Certificate().Leaf.SerialNumber.Int64() != 7 {
 		t.Fatal("stored certificate not loaded")

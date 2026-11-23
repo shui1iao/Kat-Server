@@ -111,6 +111,7 @@ type udpSession struct {
 	peer                           netip.AddrPort
 	window                         packetWindow
 	expires                        time.Time
+	idleFloor                      time.Duration // protects associations retained by older generations
 	index                          int
 	responseAEAD                   cipher.AEAD
 	// requestAEAD is the client-session subkey AEAD, derived once from
@@ -154,6 +155,7 @@ func (c *sessionStore) expire(now time.Time) {
 	}
 }
 func (c *sessionStore) touch(s *udpSession, now time.Time) {
-	s.expires = now.Add(c.idle)
+	s.idleFloor = max(s.idleFloor, c.idle)
+	s.expires = now.Add(s.idleFloor)
 	heap.Fix(&c.queue, s.index)
 }

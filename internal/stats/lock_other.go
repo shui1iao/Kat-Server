@@ -32,4 +32,5 @@ func Lock(path string) (release func(), err error) {
 	return func() { f.Close(); os.Remove(name) }, nil
 }
 
-func syncDir(string) {}
+// Directory handles cannot portably be synced on these platforms.
+func syncDir(string) error { return nil }

@@ -197,7 +197,7 @@ func (in *Inbound) validateServerTLS() error {
 		}
 		c, sum, e := tlscert.LoadPair(p.Cert, p.Key)
 		if e != nil {
-			return errors.New("cannot load TLS certificate/key")
+			return e
 		}
 		st.files = append(st.files, tlscert.NewFilePair(p.Cert, p.Key, c, sum))
 		certs = append(certs, *c)
@@ -333,8 +333,8 @@ func (a *ACMEConfig) validate() error {
 			a.dnsToken = strings.TrimSpace(string(b))
 		}
 		if d.APIURL != "" {
-			if u, e := url.Parse(d.APIURL); e != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
-				return errors.New("invalid tls.acme.dns.api_url")
+			if !tlscert.ValidCloudflareAPI(d.APIURL) {
+				return errors.New("tls.acme.dns.api_url requires HTTPS (HTTP only for literal loopback)")
 			}
 		}
 		for _, r := range d.Resolvers {

@@ -113,7 +113,7 @@ func (s *Server) prepareAnyTLS(prev *Server) error {
 			return errors.New("same AnyTLS identity must share budgets and padding scheme")
 		}
 		codec := codecs[id]
-		conf := A.Config{Password: o.Password, PaddingScheme: o.PaddingScheme, MaxSessions: o.MaxSessions, MaxTotalStreams: o.MaxStreams, MaxStreams: o.SessionStreams, StreamInboundBytes: o.StreamBytes, StreamOutboundBytes: o.StreamBytes, SessionInboundBytes: o.SessionBytes, SessionOutboundBytes: o.SessionBytes, HandshakeTimeout: s.cfg.Limits.HandshakeTimeout.value(), TargetTimeout: s.cfg.Limits.HandshakeTimeout.value(), SlowConsumerTimeout: o.SlowTimeout.value(), WriteTimeout: o.SlowTimeout.value()}
+		conf := A.Config{Password: o.Password, PaddingScheme: o.PaddingScheme, MaxSessions: o.MaxSessions, MaxAuthenticating: s.cfg.Limits.Handshakes, MaxTotalStreams: o.MaxStreams, MaxStreams: o.SessionStreams, StreamInboundBytes: o.StreamBytes, StreamOutboundBytes: o.StreamBytes, SessionInboundBytes: o.SessionBytes, SessionOutboundBytes: o.SessionBytes, HandshakeTimeout: s.cfg.Limits.HandshakeTimeout.value(), TargetTimeout: s.cfg.Limits.HandshakeTimeout.value(), SlowConsumerTimeout: o.SlowTimeout.value(), WriteTimeout: o.SlowTimeout.value()}
 		if codec == nil {
 			for _, p := range prevs {
 				if reflect.DeepEqual(p.conf, conf) {
@@ -124,7 +124,15 @@ func (s *Server) prepareAnyTLS(prev *Server) error {
 		}
 		if codec == nil {
 			var e error
-			codec, e = A.NewServer(conf)
+			for _, p := range prevs {
+				if p.conf.Password == conf.Password {
+					codec, e = p.codec.PrepareSuccessor(conf)
+					break
+				}
+			}
+			if codec == nil && e == nil {
+				codec, e = A.NewServer(conf)
+			}
 			if e != nil {
 				return errors.New("invalid AnyTLS server config")
 			}

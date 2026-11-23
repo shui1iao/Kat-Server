@@ -307,10 +307,20 @@ func TestSSAdmissionRST(t *testing.T) {
 	s := startTest(t, ssIn(), func(c *Config) { c.Limits.Handshakes = 1 })
 	c := dialPeer(t, s, nil)
 	waitFor(t, func() bool { return s.Stats().Handshakes == 1 })
-	other := dialPeer(t, s, nil)
-	requireRST(t, other)
-	other.Close()
-	c.Close()
+	defer c.Close()
+	rejected := s.Stats().Rejected
+	other, err := net.DialTimeout("tcp", s.Addresses()[0].String(), time.Second)
+	if err != nil {
+		// The accepted socket's zero-linger close can beat completion of
+		// connect(2); only the same observed reset qualifies here.
+		if !errors.Is(err, syscall.ECONNRESET) {
+			t.Fatalf("wanted admission RST at connect, got %v", err)
+		}
+	} else {
+		defer other.Close()
+		requireRST(t, other)
+	}
+	waitFor(t, func() bool { return s.Stats().Rejected == rejected+1 && s.Stats().Handshakes == 1 })
 }
 func TestSharedIdentityConfigConflicts(t *testing.T) {
 	a := ssIn()

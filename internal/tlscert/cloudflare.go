@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"time"
@@ -23,6 +24,20 @@ type DNSProvider interface {
 
 // DefaultCloudflareAPI is the Cloudflare API v4 base URL.
 const DefaultCloudflareAPI = "https://api.cloudflare.com/client/v4"
+
+// ValidCloudflareAPI permits HTTP only for explicit loopback test servers;
+// hostnames are not resolved to decide whether sending a credential is safe.
+func ValidCloudflareAPI(base string) bool {
+	u, e := url.Parse(base)
+	if e != nil || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return false
+	}
+	if u.Scheme == "https" {
+		return true
+	}
+	ip, e := netip.ParseAddr(u.Hostname())
+	return u.Scheme == "http" && e == nil && ip.Zone() == "" && ip.Unmap().IsLoopback()
+}
 
 // Cloudflare is a DNS-01 provider using a scoped API token (Zone:DNS:Edit on
 // the zone; Zone:Read as well when ZoneID is not given). The token is only
@@ -49,6 +64,9 @@ func (c *Cloudflare) do(ctx context.Context, method, path string, body any, out 
 	if base == "" {
 		base = DefaultCloudflareAPI
 	}
+	if !ValidCloudflareAPI(base) {
+		return errors.New("cloudflare: insecure or invalid API URL")
+	}
 	var rd io.Reader
 	if body != nil {
 		b, e := json.Marshal(body)
@@ -65,10 +83,13 @@ func (c *Cloudflare) do(ctx context.Context, method, path string, body any, out 
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	hc := c.HTTP
-	if hc == nil {
-		hc = &http.Client{Timeout: 30 * time.Second}
+	hc := http.Client{Timeout: 30 * time.Second}
+	if c.HTTP != nil {
+		hc = *c.HTTP
 	}
+	// The API is not a browser. Never submit DNS credentials or a mutating
+	// request to a redirected destination, even a related host.
+	hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	res, e := hc.Do(req)
 	if e != nil {
 		return fmt.Errorf("cloudflare: %s request failed", method)

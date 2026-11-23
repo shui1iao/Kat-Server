@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/netip"
 	"time"
@@ -55,32 +54,14 @@ func isHexDigit(b byte) bool {
 	return b >= '0' && b <= '9' || b >= 'a' && b <= 'f' || b >= 'A' && b <= 'F'
 }
 
-// recordingReader keeps a copy of every byte read.
-type recordingReader struct {
-	r   io.Reader
-	buf []byte
-}
-
-func (r *recordingReader) Read(p []byte) (int, error) {
-	n, e := r.r.Read(p)
-	r.buf = append(r.buf, p[:n]...)
-	return n, e
-}
-
 func parseTrojan(c net.Conn, in Inbound) (request, error) {
 	r := request{Mode: "trojan", UserIndex: -1, Datagrams: trojanDatagrams{}}
-	var head [58]byte
+	var head [56]byte
 	n := 0
 	for n < len(head) {
 		m, e := c.Read(head[n:])
 		for i := n; i < n+m; i++ {
-			ok := isHexDigit(head[i])
-			if i == 56 {
-				ok = head[i] == '\r'
-			} else if i == 57 {
-				ok = head[i] == '\n'
-			}
-			if !ok {
+			if !isHexDigit(head[i]) {
 				return r, &trojanReject{head: append([]byte(nil), head[:n+m]...), err: errTrojanFormat}
 			}
 		}
@@ -100,30 +81,40 @@ func parseTrojan(c net.Conn, in Inbound) (request, error) {
 			r.UserIndex = i
 		}
 	}
+	// Once the digest matches, no bytes from this request may reach the fallback,
+	// including when the separator itself is invalid. Only unmatched traffic
+	// carries a replayable prefix to the configured web backend.
 	if match == 0 {
-		return r, &trojanReject{auth: true, head: append([]byte(nil), head[:]...), err: errors.New("authentication failed")}
-	}
-	rr := &recordingReader{r: c, buf: append([]byte(nil), head[:]...)}
-	reject := func(e error) (request, error) {
-		if errors.Is(e, io.EOF) || errors.Is(e, io.ErrUnexpectedEOF) || isTimeout(e) {
-			return r, e
+		prefix := append([]byte(nil), head[:]...)
+		for _, want := range []byte{'\r', '\n'} {
+			v, e := readN(c, 1)
+			if e != nil {
+				return r, e
+			}
+			prefix = append(prefix, v[0])
+			if v[0] != want {
+				return r, &trojanReject{head: prefix, err: errTrojanFormat}
+			}
 		}
-		return r, &trojanReject{head: rr.buf, err: e}
+		return r, &trojanReject{auth: true, head: prefix, err: errors.New("authentication failed")}
 	}
-	v, e := readN(rr, 1)
+	if e := expectCRLF(c); e != nil {
+		return r, e
+	}
+	v, e := readN(c, 1)
 	if e != nil {
-		return reject(e)
+		return r, e
 	}
 	r.Command = v[0]
 	if r.Command != 1 && r.Command != 3 {
-		return reject(errors.New("unsupported Trojan command"))
+		return r, errors.New("unsupported Trojan command")
 	}
-	r.Target, e = readAddress(rr, false)
+	r.Target, e = readAddress(c, false)
 	if e != nil {
-		return reject(e)
+		return r, e
 	}
-	if e = expectCRLF(rr); e != nil {
-		return reject(e)
+	if e = expectCRLF(c); e != nil {
+		return r, e
 	}
 	return r, nil
 }

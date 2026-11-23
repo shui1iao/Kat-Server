@@ -113,7 +113,8 @@ func TestOutboundCountByteBudgetAndTimeoutCleanup(t *testing.T) {
 func TestSessionAdmissionAndAuthTimeout(t *testing.T) {
 	c := cfg()
 	c.MaxSessions = 1
-	c.HandshakeTimeout = 30 * time.Millisecond
+	c.MaxAuthenticating = 1
+	c.HandshakeTimeout = 100 * time.Millisecond
 	s, e := NewServer(c)
 	if e != nil {
 		t.Fatal(e)
@@ -125,8 +126,11 @@ func TestSessionAdmissionAndAuthTimeout(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- s.Serve(ctx, a, noHandler) }()
 	deadline := time.Now().Add(time.Second)
-	for s.Stats().Sessions == 0 && time.Now().Before(deadline) {
+	for s.Stats().Authenticating == 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
+	}
+	if st := s.Stats(); st.Sessions != 0 || st.Authenticating != 1 {
+		t.Fatal("unauthenticated peer occupied formal quota", st)
 	}
 	x, y := net.Pipe()
 	defer y.Close()

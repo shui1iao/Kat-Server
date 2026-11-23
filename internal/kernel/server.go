@@ -37,27 +37,28 @@ type core struct {
 	counters                                  Counters
 
 	// 0.7.0 runtime: log sink, statistics, connection registry, management API.
-	log          *logger
-	reg          *stats.Registry
-	started      time.Time
-	detailsOn    atomic.Bool
-	flowID       atomic.Uint64
-	flowMu       sync.Mutex
-	flows        map[uint64]*flow
-	tcpFlows     atomic.Int64
-	api          *apiState
-	apiMu        sync.Mutex // serializes API ownership changes
-	statsMu      sync.Mutex // guards statsPath/statsRelease/lockedFile/selPath
-	statsPath    string     // persisted statistics file ("" = not persisted)
-	lockedFile   string     // statistics file whose instance lock is held
-	statsRelease func()
-	saveInterval atomic.Int64
-	saveMu       sync.Mutex
-	lastSave     atomic.Int64
-	saveErrors   atomic.Int64
-	bgStop       chan struct{}
-	bgDone       chan struct{}
-	stopOnce     sync.Once
+	log               *logger
+	reg               *stats.Registry
+	started           time.Time
+	detailsOn         atomic.Bool
+	flowID            atomic.Uint64
+	flowMu            sync.Mutex
+	flows             map[uint64]*flow
+	tcpFlows          atomic.Int64
+	api               *apiState
+	apiMu             sync.Mutex // serializes API ownership changes
+	statsMu           sync.Mutex // guards statsPath/statsRelease/lockedFile/selPath
+	statsPath         string     // persisted statistics file ("" = not persisted)
+	quarantineBlocked string     // failed quarantine: never overwrite this target during this run
+	lockedFile        string     // statistics file whose instance lock is held
+	statsRelease      func()
+	saveInterval      atomic.Int64
+	saveMu            sync.Mutex
+	lastSave          atomic.Int64
+	saveErrors        atomic.Int64
+	bgStop            chan struct{}
+	bgDone            chan struct{}
+	stopOnce          sync.Once
 
 	// 0.7.0 reload: generations and the listener registry.
 	gen            atomic.Pointer[Server]
@@ -393,7 +394,7 @@ func (s *Server) handle(raw net.Conn, in Inbound) {
 		if trojan && tr.auth || errors.Is(e, errSOCKSAuth) || errors.Is(e, ss.ErrAuth) {
 			s.authFailed(raw.RemoteAddr(), &in)
 		}
-		if trojan && in.Fallback != "" {
+		if trojan && req.UserIndex < 0 && in.Fallback != "" {
 			releaseHand()
 			s.trojanFallback(c, tr.head, &in)
 			return

@@ -135,7 +135,7 @@ func (k *core) prepareState(c *Config) (*statePlan, error) {
 		p.want = c.Stats.File
 	}
 	k.statsMu.Lock()
-	cur, oldStats := k.lockedFile, k.statsPath
+	cur, oldStats, blocked := k.lockedFile, k.statsPath, k.quarantineBlocked
 	k.statsMu.Unlock()
 	// Clean aliases must not contend with the instance's own lock.
 	same := p.want == cur
@@ -157,7 +157,14 @@ func (k *core) prepareState(c *Config) (*statePlan, error) {
 		}
 		p.release = release
 	}
-	if c.persistStats() && p.want != "" {
+	// Paused persistence remains paused on unrelated reloads, including aliases.
+	isBlocked := blocked != "" && filepath.Clean(p.want) == blocked
+	if blocked != "" && p.want != "" && !isBlocked {
+		a, ae := os.Stat(blocked)
+		b, be := os.Stat(p.want)
+		isBlocked = ae == nil && be == nil && os.SameFile(a, b)
+	}
+	if c.persistStats() && p.want != "" && !isBlocked {
 		p.persist = p.want
 	}
 	// Unchanged persistence paths do not need a probe or rewrite. A failed

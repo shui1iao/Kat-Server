@@ -360,7 +360,9 @@ func (r *Registry) Save(path string, now time.Time) error {
 		return e
 	}
 	ok = true
-	syncDir(dir)
+	if e := syncDir(dir); e != nil {
+		return fmt.Errorf("sync statistics directory: %w", e)
+	}
 	return nil
 }
 

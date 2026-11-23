@@ -292,6 +292,26 @@ func (a *udpAssociation) sendLoop() {
 	}
 }
 
+// selectDestination keeps DNS order but never treats one denied address as
+// a denial of later, permitted answers. A missing address family is not an ACL denial.
+func (a *udpAssociation) selectDestination(candidates []netip.AddrPort) (netip.AddrPort, *net.UDPConn, bool) {
+	blocked := 0
+	for _, ip := range candidates {
+		if a.server.cfg.blockedDestination(ip.Addr()) {
+			blocked++
+			continue
+		}
+		socket := a.outbound4
+		if ip.Addr().Is6() {
+			socket = a.outbound6
+		}
+		if socket != nil {
+			return ip, socket, false
+		}
+	}
+	return netip.AddrPort{}, nil, len(candidates) > 0 && blocked == len(candidates)
+}
+
 // send resolves and forwards one datagram directly.
 func (a *udpAssociation) send(ctx context.Context, p packet, idle time.Duration) {
 	candidates, e := a.server.routeUDP(ctx, p.target)
@@ -300,26 +320,10 @@ func (a *udpAssociation) send(ctx context.Context, p packet, idle time.Duration)
 		a.server.resolutionFailure(e)
 		return
 	}
-	var target netip.AddrPort
-	var socket *net.UDPConn
-	blocked := false
-	for _, ip := range candidates {
-		if a.server.cfg.blockedDestination(ip.Addr()) {
-			blocked = true
-			return
-		}
-		sock := a.outbound4
-		if ip.Addr().Is6() {
-			sock = a.outbound6
-		}
-		if sock != nil {
-			target, socket = ip, sock
-			break
-		}
-	}
+	target, socket, allBlocked := a.selectDestination(candidates)
 	if socket == nil {
 		a.server.counters.Dropped.Add(1)
-		if blocked {
+		if allBlocked {
 			a.server.failure(failBlocked, "udp", -1)
 		} else {
 			a.server.failure(failUDPInvalid, "udp", -1)

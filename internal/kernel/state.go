@@ -2,6 +2,7 @@ package kernel
 
 import (
 	"errors"
+	"path/filepath"
 	"time"
 
 	"github.com/shui1iao/Kat/internal/stats"
@@ -37,6 +38,9 @@ func (k *core) openState(c *Config) {
 
 // loadStats loads persisted counters into the (already keyed) registry.
 func (k *core) loadStats(c *Config) {
+	k.loadStatsWith(c, stats.QuarantineCorrupt)
+}
+func (k *core) loadStatsWith(c *Config, quarantine func(string, time.Time) (string, error)) {
 	k.statsMu.Lock()
 	defer k.statsMu.Unlock()
 	if !c.persistStats() || k.lockedFile != c.Stats.File {
@@ -44,7 +48,13 @@ func (k *core) loadStats(c *Config) {
 	}
 	path := c.Stats.File
 	if e := k.reg.Load(path); errors.Is(e, stats.ErrCorrupt) {
-		moved, _ := stats.QuarantineCorrupt(path, time.Now())
+		moved, qe := quarantine(path, time.Now())
+		if qe != nil {
+			k.statsPath = ""
+			k.quarantineBlocked = filepath.Clean(path)
+			k.notice(levelWarn, "kat event=stats_persist_disabled reason=quarantine_failed file="+eventToken(path, 256)+" error="+eventToken(qe.Error(), 200))
+			return
+		}
 		k.notice(levelWarn, "kat event=stats_load_failed reason=corrupt action=start_from_zero moved_to="+eventToken(moved, 300))
 		k.statsPath = path
 	} else if e != nil {
@@ -106,12 +116,12 @@ func (k *core) saveStatsLocked() error {
 		return nil
 	}
 	e := k.reg.Save(path, time.Now())
-	k.lastSave.Store(time.Now().UnixNano())
 	if e != nil {
 		k.saveErrors.Add(1)
-		k.notice(levelWarn, "kat event=stats_save_failed reason=io file="+eventToken(path, 256))
+		k.notice(levelWarn, "kat event=stats_save_failed reason=io file="+eventToken(path, 256)+" error="+eventToken(e.Error(), 200))
 		return e
 	}
+	k.lastSave.Store(time.Now().UnixNano())
 	k.notice(levelDebug, "kat event=stats_saved")
 	return nil
 }

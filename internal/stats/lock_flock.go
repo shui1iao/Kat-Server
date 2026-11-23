@@ -32,9 +32,11 @@ func Lock(path string) (release func(), err error) {
 	return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
 }
 
-func syncDir(dir string) {
-	if d, e := os.Open(dir); e == nil {
-		_ = d.Sync()
-		d.Close()
+func syncDir(dir string) error {
+	d, e := os.Open(dir)
+	if e != nil {
+		return e
 	}
+	defer d.Close()
+	return d.Sync()
 }

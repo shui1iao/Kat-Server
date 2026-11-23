@@ -68,8 +68,8 @@ func TestCompactGlobalBudgetAllocationPaths(t *testing.T) {
 				t.Fatal("bucket failure charged/allocated")
 			}
 		} else {
-			if head == nil || *head != 0 || compactRetained.Load() != fake+bucketBytes {
-				t.Fatal("bucket-success entry-failure did not retain exact charge/empty index")
+			if head != nil || len(first.spareBuckets) != 1 || first.spareBuckets[0].live != 0 || compactRetained.Load() != fake+bucketBytes {
+				t.Fatal("bucket-success entry-failure did not retain exact charge/reusable empty page")
 			}
 		}
 		if err := second.admit(compactKey(23, 32), testTime); err != ErrCapacity {

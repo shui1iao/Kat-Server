@@ -29,13 +29,17 @@ var testSerial int64 = 1000
 // and returns the file paths and the serial number.
 func writeTestCert(t *testing.T, dir, base string, names ...string) (string, string, int64) {
 	t.Helper()
+	return writeTimedTestCert(t, dir, base, time.Now(), names...)
+}
+func writeTimedTestCert(t *testing.T, dir, base string, at time.Time, names ...string) (string, string, int64) {
+	t.Helper()
 	key, e := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if e != nil {
 		t.Fatal(e)
 	}
 	testSerial++
 	serial := testSerial
-	tpl := &x509.Certificate{SerialNumber: big.NewInt(serial), Subject: pkix.Name{CommonName: names[0]}, DNSNames: names, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, BasicConstraintsValid: true}
+	tpl := &x509.Certificate{SerialNumber: big.NewInt(serial), Subject: pkix.Name{CommonName: names[0]}, DNSNames: names, NotBefore: at.Add(-time.Hour), NotAfter: at.Add(time.Hour), KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, BasicConstraintsValid: true}
 	der, e := x509.CreateCertificate(rand.Reader, tpl, tpl, &key.PublicKey, key)
 	if e != nil {
 		t.Fatal(e)
@@ -211,6 +215,21 @@ func TestServerTLSReloadSwapsAndRefusesCertificate(t *testing.T) {
 	}
 	held.Write([]byte("after-reload"))
 	trojanEchoRead(t, held, "after-reload")
+	for _, tc := range []struct {
+		at     time.Time
+		reason string
+	}{{time.Now().Add(-2 * time.Hour), "expired"}, {time.Now().Add(2 * time.Hour), "not yet valid"}} {
+		writeTimedTestCert(t, dir, "a", tc.at, "a.example")
+		if _, err := s.Reload("test"); err == nil || !strings.Contains(err.Error(), tc.reason) {
+			t.Fatalf("reload accepted invalid time or hid the reason: %v", err)
+		}
+		if got, c := peerSerial(t, addr, "a.example"); got != s2 {
+			c.Close()
+			t.Fatal("invalid time displaced old certificate")
+		} else {
+			c.Close()
+		}
+	}
 	os.WriteFile(kp, []byte("broken"), 0o600)
 	if _, e := s.Reload("test"); e == nil || !strings.Contains(e.Error(), "cannot load TLS certificate/key") {
 		t.Fatalf("broken key reload: %v", e)

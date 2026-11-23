@@ -53,25 +53,53 @@ type Config struct {
 	Password                                                                               string
 	UserID                                                                                 string
 	PaddingScheme                                                                          string
-	MaxSessions, MaxTotalStreams, MaxStreams                                               int
+	MaxSessions, MaxAuthenticating, MaxTotalStreams, MaxStreams                            int
 	MaxSettings, MaxAuthPadding, MaxFrameData, MaxClosedStreams                            int
 	StreamInboundFrames, StreamInboundBytes, SessionInboundFrames, SessionInboundBytes     int
 	StreamOutboundFrames, StreamOutboundBytes, SessionOutboundFrames, SessionOutboundBytes int
 	HandshakeTimeout, TargetTimeout, SlowConsumerTimeout, WriteTimeout                     time.Duration
 }
 type Server struct {
-	cfg               Config
-	digest            [32]byte
-	paddingMD5        string
-	mu                sync.Mutex
-	sessions, streams int
+	cfg                               Config
+	digest                            [32]byte
+	paddingMD5                        string
+	quota                             *identityQuota // shared by continuous generations of the same credential
+	sessions, streams, authenticating int            // per-codec observability, protected by quota.mu
 }
-type ServerStats struct{ Sessions, Streams int }
+type identityQuota struct {
+	mu                                         sync.Mutex
+	sessions, streams, authenticating          int
+	maxSessions, maxStreams, maxAuthenticating int
+}
+type ServerStats struct{ Sessions, Streams, Authenticating int }
+
+// PrepareSuccessor constructs a codec without modifying the current limits.
+func (s *Server) PrepareSuccessor(c Config) (*Server, error) {
+	n, e := NewServer(c)
+	if e != nil {
+		return nil, e
+	}
+	if s.digest != n.digest {
+		return nil, ErrConfig
+	}
+	n.quota = s.quota
+	return n, nil
+}
+
+// ActivateLimits is called only at the irrevocable publication boundary.
+func (s *Server) ActivateLimits() {
+	q := s.quota
+	q.mu.Lock()
+	q.maxSessions = s.cfg.MaxSessions
+	q.maxStreams = s.cfg.MaxTotalStreams
+	q.maxAuthenticating = s.cfg.MaxAuthenticating
+	q.mu.Unlock()
+}
 
 func (s *Server) Stats() ServerStats {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return ServerStats{s.sessions, s.streams}
+	s.quota.mu.Lock()
+	defer s.quota.mu.Unlock()
+	return ServerStats{s.sessions, s.streams, s.authenticating}
 }
 func NewServer(c Config) (*Server, error) {
 	if c.Password == "" {
@@ -81,7 +109,7 @@ func NewServer(c Config) (*Server, error) {
 		p *int
 		d int
 	}{
-		{&c.MaxSessions, 128}, {&c.MaxTotalStreams, 1024}, {&c.MaxStreams, 64}, {&c.MaxSettings, 4096}, {&c.MaxAuthPadding, 65535}, {&c.MaxFrameData, 65535}, {&c.MaxClosedStreams, 1024},
+		{&c.MaxSessions, 128}, {&c.MaxAuthenticating, 128}, {&c.MaxTotalStreams, 1024}, {&c.MaxStreams, 64}, {&c.MaxSettings, 4096}, {&c.MaxAuthPadding, 65535}, {&c.MaxFrameData, 65535}, {&c.MaxClosedStreams, 1024},
 		{&c.StreamInboundFrames, 16}, {&c.StreamInboundBytes, 131072}, {&c.SessionInboundFrames, 128}, {&c.SessionInboundBytes, 1048576},
 		{&c.StreamOutboundFrames, 8}, {&c.StreamOutboundBytes, 131072}, {&c.SessionOutboundFrames, 128}, {&c.SessionOutboundBytes, 1048576},
 	}
@@ -116,6 +144,8 @@ func NewServer(c Config) (*Server, error) {
 	}
 	fingerprint := md5.Sum([]byte(c.PaddingScheme))
 	s := &Server{cfg: c, digest: sha256.Sum256([]byte(c.Password)), paddingMD5: hex.EncodeToString(fingerprint[:])}
+	s.quota = &identityQuota{}
+	s.ActivateLimits()
 	s.cfg.Password = ""
 	return s, nil
 }

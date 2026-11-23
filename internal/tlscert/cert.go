@@ -14,6 +14,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -61,6 +62,18 @@ func ParsePair(certPEM, keyPEM []byte) (*tls.Certificate, error) {
 	return &c, nil
 }
 
+var errFuture = errors.New("certificate is not yet valid")
+
+func validAt(c *tls.Certificate, at time.Time) error {
+	if at.Before(c.Leaf.NotBefore) {
+		return errFuture
+	}
+	if at.After(c.Leaf.NotAfter) {
+		return errors.New("certificate has expired")
+	}
+	return nil
+}
+
 func pairSum(certPEM, keyPEM []byte) [32]byte {
 	h := sha256.New()
 	h.Write(certPEM)
@@ -85,6 +98,9 @@ func LoadPair(certFile, keyFile string) (*tls.Certificate, [32]byte, error) {
 	if e != nil {
 		return nil, [32]byte{}, ErrLoad
 	}
+	if e := validAt(c, Now()); e != nil {
+		return nil, [32]byte{}, fmt.Errorf("%w: %w", ErrLoad, e)
+	}
 	return c, pairSum(cb, kb), nil
 }
 
@@ -108,10 +124,11 @@ type FilePair struct {
 	Holder
 	CertFile, KeyFile string
 
-	sum    atomic.Pointer[[32]byte] // content of the installed pair
-	badSum [32]byte                 // content last refused (reported once)
-	hasBad bool
-	readOK bool // false after a read error was reported
+	sum     atomic.Pointer[[32]byte] // content of the installed pair
+	badSum  [32]byte                 // content last refused (reported once)
+	retryAt time.Time                // a not-yet-valid pair can become usable without any file change
+	hasBad  bool
+	readOK  bool // false after a read error was reported
 }
 
 // NewFilePair returns a pair holding an already loaded certificate.
@@ -157,12 +174,12 @@ func (f *FilePair) Check(now time.Time) (CheckResult, error) {
 				f.hasBad, f.readOK = false, true
 				return Unchanged, nil
 			}
-			if f.hasBad && sum == f.badSum {
+			if f.hasBad && sum == f.badSum && (f.retryAt.IsZero() || now.Before(f.retryAt)) {
 				return Unchanged, nil
 			}
 			c, err = ParsePair(cb, kb)
-			if err == nil && now.After(c.Leaf.NotAfter) {
-				err = errors.New("certificate has expired")
+			if err == nil {
+				err = validAt(c, now)
 			}
 			if err == nil {
 				break
@@ -182,6 +199,10 @@ func (f *FilePair) Check(now time.Time) (CheckResult, error) {
 			return Refused, err
 		}
 		f.readOK = true
+		f.retryAt = time.Time{}
+		if errors.Is(err, errFuture) {
+			f.retryAt = c.Leaf.NotBefore
+		}
 		f.badSum, f.hasBad = sum, true
 		return Refused, err
 	}

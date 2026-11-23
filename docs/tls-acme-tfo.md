@@ -34,7 +34,7 @@
 - `kat reload` / SIGHUP 时重新读取所有证书文件；
 - `watch` 打开时，Kat 按 `watch_interval` 检查文件内容，变化后加载新证书。外部程序分两步写证书和私钥时，Kat 发现不配对会等 1 秒再读一次；
 - 换证书只影响之后的新握手，已有连接不断开；
-- 新证书无效（无法解析、证书与私钥不配对、已过期、无法读取）时：reload 整体拒绝并保持旧配置；跟随文件时保留旧证书并输出一次告警 `kat event=tls_certificate_reload_failed source=watch ... action=keep_previous`，文件修好后自动恢复。成功时输出 `kat event=tls_certificate_reloaded source=reload|watch`，附证书序列号、名称与到期时间。
+- 新证书无效（无法解析、证书与私钥不配对、尚未生效或已过期、无法读取）时：reload 整体拒绝并保持旧配置；跟随文件时保留旧证书并输出一次告警 `kat event=tls_certificate_reload_failed source=watch ... action=keep_previous`，文件修好后自动恢复。成功时输出 `kat event=tls_certificate_reloaded source=reload|watch`，附证书序列号、名称与到期时间。
 
 不支持 mTLS、ECH、OCSP stapling。
 
@@ -62,9 +62,9 @@
 | `key_type` | `ecdsa` | 证书私钥类型：`ecdsa`（P-256）或 `rsa`（2048）。 |
 | `storage` | `<状态目录>/acme` | 账户密钥和证书的存放目录（root 运行时为 `/var/lib/kat/acme`）。 |
 | `http_listen` | `:80` | `http-01` 独立监听地址；只在验证期间监听。多个证书使用同一地址时共用一个监听。 |
-| `webroot` | 空 | `http-01` 改为把验证文件写入 `<webroot>/.well-known/acme-challenge/`，由现有 Web 服务器提供；与 `http_listen` 二选一。 |
+| `webroot` | 空 | `http-01` 改为把验证文件写入 `<webroot>/.well-known/acme-challenge/`，由现有 Web 服务器提供；与 `http_listen` 二选一。须提供已存在的真实目录，路径不含符号链接；webroot 与两级挑战目录须由 root 或 Kat 运行用户所有，不能向组或其他身份开放写入，非 POSIX 系统须配置等价 ACL。不会覆盖已有同名文件。 |
 | `dns.provider` | — | 目前只有 `cloudflare`。 |
-| `dns.api_token` / `dns.api_token_file` | — | 二选一。请使用只限所需域名、只有 Zone:DNS:Edit 权限（不写 `zone_id` 时另需 Zone:Read）的 API Token；不支持 Global API Key。 |
+| `dns.api_token` / `dns.api_token_file` | — | 二选一。自定义 `api_url` 必须使用 HTTPS（回环 IP 的 HTTP 仅用于本机测试），不跟随重定向。请使用只限所需域名、只有 Zone:DNS:Edit 权限（不写 `zone_id` 时另需 Zone:Read）的 API Token；不支持 Global API Key。 |
 | `dns.zone_id` | 自动查找 | 写了就不需要 Zone:Read。 |
 | `dns.resolvers` | 域名的权威服务器 | 申请前确认 TXT 已生效时查询的 DNS 服务器（`host:port`）。 |
 | `dns.propagation_timeout` | `2m` | 等待 TXT 生效的上限（1 秒到 1 小时）；超时只告警并继续提交验证。 |
@@ -76,7 +76,7 @@
 - `tls-alpn-01`：CA 连接 `<域名>:443`，由这个入站本身应答（`acme-tls/1`），因此入站需要在 443 端口对外可达。
 - `dns-01`：Kat 通过 Cloudflare API 创建 `_acme-challenge` TXT 记录，验证完成后按记录 ID 删除（只删自己创建的记录）。
 
-**存储与重启**：账户密钥按 CA 目录和邮箱区分，证书按域名集合区分，文件权限 0600、目录 0700，写入用临时文件加原子改名。重启时如果已存证书仍有效且未到续期时间，直接使用，不会重新申请。
+**存储与重启**：账户密钥按 CA 目录和邮箱区分，证书按域名集合区分，新格式以排序后的完整域名集合命名存储目录，证书链和私钥保存在同一个 0600 的 `pair.pem`，整对临时写入并原子替换。无新格式时仍可读取旧目录中匹配相同域名集合的有效证书，不删除旧文件。重启时如果已存证书仍有效且未到续期时间，直接使用，不会重新申请。
 
 **续期**：证书剩余有效期不足 1/3 时续期（90 天证书约在到期前 30 天）。失败时告警 `kat event=acme_renew_failed ... attempt=N retry_in=...`（旧证书继续使用，已过期时注明 `current_expired=true`），按退避重试：间隔从有效期的 1/20（1 分钟封顶，至少 5 秒）开始翻倍，最长为有效期的 1/6 与 6 小时中较小者。续期成功后热替换，已有连接不断开。
 

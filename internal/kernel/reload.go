@@ -344,6 +344,12 @@ func (k *core) commitContext(ctx context.Context, g *Server, p *plan) error {
 	var removed []*tcpEntry
 	udpUsed := map[string]bool{}
 	k.bindMu.Lock()
+	g.commitSSProtection()
+	for _, in := range g.cfg.Inbounds {
+		if in.anytlsServer != nil {
+			in.anytlsServer.ActivateLimits()
+		}
+	}
 	used := map[string]bool{}
 	for i := range g.cfg.Inbounds {
 		in := &g.cfg.Inbounds[i]

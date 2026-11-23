@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"time"
 )
@@ -139,15 +140,41 @@ func (s *Server) Serve(ctx context.Context, transport io.ReadWriteCloser, handle
 	if transport == nil || handler == nil {
 		return ErrConfig
 	}
-	s.mu.Lock()
-	if s.sessions >= s.cfg.MaxSessions {
-		s.mu.Unlock()
+	q := s.quota
+	q.mu.Lock()
+	if q.authenticating >= q.maxAuthenticating || q.sessions >= q.maxSessions {
+		q.mu.Unlock()
 		_ = transport.Close()
 		return ErrSessionLimit
 	}
-	s.sessions++
-	s.mu.Unlock()
-	defer func() { s.mu.Lock(); s.sessions--; s.mu.Unlock() }()
+	q.authenticating++
+	s.authenticating++
+	q.mu.Unlock()
+	admitted := false
+	promote := func() bool {
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		if q.sessions >= q.maxSessions {
+			return false
+		}
+		q.authenticating--
+		s.authenticating--
+		q.sessions++
+		s.sessions++
+		admitted = true
+		return true
+	}
+	defer func() {
+		q.mu.Lock()
+		if admitted {
+			q.sessions--
+			s.sessions--
+		} else {
+			q.authenticating--
+			s.authenticating--
+		}
+		q.mu.Unlock()
+	}()
 	child, cancel := context.WithCancelCause(ctx)
 	sess := &session{server: s, transport: transport, ctx: child, cancel: cancel, change: make(chan struct{}), active: make(map[uint32]*Stream), workers: make(map[*Stream]bool), closed: make(map[uint32]bool), writerDone: make(chan struct{}), watchDone: make(chan struct{})}
 	go func() {
@@ -162,14 +189,11 @@ func (s *Server) Serve(ctx context.Context, transport io.ReadWriteCloser, handle
 	_, err := io.ReadFull(transport, initial[:])
 	if err == nil {
 		n := int(binary.BigEndian.Uint16(initial[32:]))
-		if n > s.cfg.MaxAuthPadding {
+		if n > s.cfg.MaxAuthPadding || subtle.ConstantTimeCompare(initial[:32], s.digest[:]) != 1 {
 			err = ErrAuthentication
 		} else {
 			err = discard(transport, n)
 		}
-	}
-	if err == nil && subtle.ConstantTimeCompare(initial[:32], s.digest[:]) != 1 {
-		err = ErrAuthentication
 	}
 	clear(initial[:])
 	if err != nil {
@@ -182,7 +206,7 @@ func (s *Server) Serve(ctx context.Context, transport io.ReadWriteCloser, handle
 		return err
 	}
 	go sess.writeLoop()
-	err = sess.readLoop(handler, authTimer)
+	err = sess.readLoop(handler, authTimer, promote)
 	if sess.ctx.Err() != nil {
 		err = context.Cause(sess.ctx)
 	}
@@ -216,10 +240,14 @@ func (s *Server) Serve(ctx context.Context, transport io.ReadWriteCloser, handle
 	}
 	return err
 }
-func (s *session) readLoop(handler Handler, authTimer *time.Timer) error {
+func (s *session) readLoop(handler Handler, authTimer *time.Timer, promote func() bool) error {
 	var header [7]byte
 	for {
-		n, e := io.ReadFull(s.transport, header[:])
+		// Let an idle authenticated carrier wait indefinitely for the first byte.
+		n, e := io.ReadAtLeast(s.transport, header[:], 1)
+		if e == nil && n < len(header) {
+			e = s.frameRead(header[n:], 0)
+		}
 		if e != nil {
 			if e == io.EOF && n == 0 {
 				s.mu.Lock()
@@ -239,7 +267,7 @@ func (s *session) readLoop(handler Handler, authTimer *time.Timer) error {
 			return fmt.Errorf("%w: frame length", ErrProtocol)
 		}
 		if command == cmdWaste {
-			if e = discard(s.transport, length); e != nil {
+			if e = s.frameRead(nil, length); e != nil {
 				return e
 			}
 			continue
@@ -253,12 +281,15 @@ func (s *session) readLoop(handler Handler, authTimer *time.Timer) error {
 				return fmt.Errorf("%w: settings repeated/oversized", ErrProtocol)
 			}
 			b := make([]byte, length)
-			if _, e = io.ReadFull(s.transport, b); e != nil {
+			if e = s.frameRead(b, 0); e != nil {
 				return unexpected(e)
 			}
 			v, fp, e := parseSettings(b)
 			if e != nil {
 				return e
+			}
+			if !promote() {
+				return ErrSessionLimit
 			}
 			s.mu.Lock()
 			s.settings = true
@@ -313,7 +344,7 @@ func (s *session) readLoop(handler Handler, authTimer *time.Timer) error {
 				if !retired {
 					return fmt.Errorf("%w: PSH for unknown stream", ErrProtocol)
 				}
-				if e = discard(s.transport, length); e != nil {
+				if e = s.frameRead(nil, length); e != nil {
 					return e
 				}
 				continue
@@ -323,7 +354,7 @@ func (s *session) readLoop(handler Handler, authTimer *time.Timer) error {
 			}
 			if e = s.reserveInbound(st, length); e != nil {
 				if errors.Is(e, ErrStreamClosed) {
-					if e = discard(s.transport, length); e != nil {
+					if e = s.frameRead(nil, length); e != nil {
 						return e
 					}
 					continue
@@ -331,7 +362,7 @@ func (s *session) readLoop(handler Handler, authTimer *time.Timer) error {
 				return e
 			}
 			b := takeInboundFrame(length)
-			_, e = io.ReadFull(s.transport, b)
+			e = s.frameRead(b, 0)
 			s.publishInbound(st, b, e)
 			if e != nil {
 				return unexpected(e)
@@ -371,6 +402,38 @@ func (s *session) readLoop(handler Handler, authTimer *time.Timer) error {
 		}
 	}
 }
+
+// Bound a physical read already in progress. Budget waits and application
+// processing are not timed; clear the deadline before waiting for a new frame.
+func (s *session) frameRead(buf []byte, skip int) error {
+	if len(buf) == 0 && skip == 0 {
+		return nil
+	}
+	limit := s.server.cfg.HandshakeTimeout
+	read := func() error {
+		if skip != 0 {
+			return discard(s.transport, skip)
+		}
+		_, e := io.ReadFull(s.transport, buf)
+		return unexpected(e)
+	}
+	if d, ok := s.transport.(interface{ SetReadDeadline(time.Time) error }); ok {
+		if e := d.SetReadDeadline(time.Now().Add(limit)); e != nil {
+			return e
+		}
+		e := read()
+		if reset := d.SetReadDeadline(time.Time{}); e == nil {
+			e = reset
+		}
+		return e
+	}
+	t := time.AfterFunc(limit, func() { s.fail(context.DeadlineExceeded) })
+	e := read()
+	if !t.Stop() {
+		return context.DeadlineExceeded
+	}
+	return e
+}
 func unexpected(e error) error {
 	if e == io.EOF {
 		return io.ErrUnexpectedEOF
@@ -384,15 +447,16 @@ func (s *session) newStream(id uint32) (*Stream, error) {
 		return nil, fmt.Errorf("%w: nonmonotonic/duplicate SYN", ErrProtocol)
 	}
 	s.lastID = id
-	s.server.mu.Lock()
-	limited := len(s.workers) >= s.server.cfg.MaxStreams || s.server.streams >= s.server.cfg.MaxTotalStreams
+	s.server.quota.mu.Lock()
+	limited := len(s.workers) >= s.server.cfg.MaxStreams || s.server.quota.streams >= s.server.quota.maxStreams
 	if limited {
-		s.server.mu.Unlock()
+		s.server.quota.mu.Unlock()
 		s.remember(id)
 		return nil, ErrStreamLimit
 	}
+	s.server.quota.streams++
 	s.server.streams++
-	s.server.mu.Unlock()
+	s.server.quota.mu.Unlock()
 	ctx, cancel := context.WithCancelCause(s.ctx)
 	st := &Stream{session: s, id: id, ctx: ctx, cancel: cancel}
 	s.active[id] = st
@@ -407,9 +471,10 @@ func (s *session) prepare(st *Stream, handler Handler) {
 		delete(s.workers, st)
 		s.notify()
 		s.mu.Unlock()
-		s.server.mu.Lock()
+		s.server.quota.mu.Lock()
+		s.server.quota.streams--
 		s.server.streams--
-		s.server.mu.Unlock()
+		s.server.quota.mu.Unlock()
 		s.workerWG.Done()
 	}()
 	_ = st.SetReadDeadline(time.Now().Add(s.server.cfg.TargetTimeout))
@@ -560,6 +625,14 @@ func (s *session) send(command byte, id uint32, data []byte, st *Stream, deadlin
 		timeout = timer.C
 		defer timer.Stop()
 	}
+	if st != nil {
+		s.mu.Lock()
+		st.writeActive = true
+		st.writeExpired = false
+		st.armWriteDeadlineLocked()
+		s.mu.Unlock()
+		defer st.endWrite()
+	}
 	for {
 		s.mu.Lock()
 		if s.ctx.Err() != nil {
@@ -569,6 +642,10 @@ func (s *session) send(command byte, id uint32, data []byte, st *Stream, deadlin
 		if st != nil && st.closed {
 			s.mu.Unlock()
 			return ErrStreamClosed
+		}
+		if st != nil && (st.writeExpired || !st.writeDeadline.IsZero() && !time.Now().Before(st.writeDeadline)) {
+			s.mu.Unlock()
+			return os.ErrDeadlineExceeded
 		}
 		available := s.outFrames < c.SessionOutboundFrames && s.outBytes+cost <= c.SessionOutboundBytes && (st == nil || (st.outFrames < c.StreamOutboundFrames && st.outBytes+cost <= c.StreamOutboundBytes))
 		if available {
@@ -600,6 +677,9 @@ func (s *session) send(command byte, id uint32, data []byte, st *Stream, deadlin
 			frame.command = command
 			frame.wire = owned
 			frame.stream = st
+			if st != nil {
+				st.writeFrame = frame
+			}
 			frame.cost = cost
 			frame.release = release
 			frame.sendWatchdog = ownedWatchdog
@@ -662,6 +742,12 @@ func (s *session) releaseOutbound(f *outbound, err error) {
 	s.outFrames--
 	s.outBytes -= f.cost
 	if f.stream != nil {
+		if f.stream.writeFrame == f {
+			if f.stream.writeExpired {
+				err = os.ErrDeadlineExceeded
+			}
+			f.stream.writeFrame = nil
+		}
 		f.stream.outFrames--
 		f.stream.outBytes -= f.cost
 	}
@@ -712,13 +798,24 @@ func (s *session) writeLoop() {
 			}
 		}
 		f := s.out[0]
-		s.activeWriter = f
 		s.out[0] = nil
 		s.out = s.out[1:]
-		skip := f.stream != nil && f.stream.closed
+		// Compare under the dequeue lock too: a due timer callback need not
+		// already be scheduled. Never promote an expired queued frame to I/O.
+		var skip error
+		if st := f.stream; st != nil {
+			if st.closed {
+				skip = ErrStreamClosed
+			} else if st.writeExpired || !st.writeDeadline.IsZero() && !time.Now().Before(st.writeDeadline) {
+				skip = os.ErrDeadlineExceeded
+			}
+		}
+		if skip == nil {
+			s.activeWriter = f
+		}
 		s.mu.Unlock()
-		if skip {
-			s.releaseOutbound(f, ErrStreamClosed)
+		if skip != nil {
+			s.releaseOutbound(f, skip)
 			continue
 		}
 		wire := f.wire

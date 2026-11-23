@@ -22,6 +22,11 @@ type Stream struct {
 	closed, remote                                                        bool
 	err                                                                   error
 	readDeadline, writeDeadline                                           time.Time
+	// Protected by session.mu, one write operation at a time under wMu.
+	writeActive, writeExpired bool
+	writeEpoch                uint64
+	writeTimer                *time.Timer
+	writeFrame                *outbound
 }
 
 func (st *Stream) ID() uint32               { return st.id }
@@ -44,9 +49,64 @@ func (st *Stream) SetWriteDeadline(t time.Time) error {
 	s := st.session
 	s.mu.Lock()
 	st.writeDeadline = t
+	st.armWriteDeadlineLocked()
 	s.notify()
 	s.mu.Unlock()
 	return nil
+}
+
+// Never apply a stream deadline to an unrelated writer. A queued frame can
+// be withdrawn atomically; once transport I/O owns the frame it may already
+// have emitted a prefix, so synchronization requires terminating the carrier.
+func (st *Stream) armWriteDeadlineLocked() {
+	st.writeEpoch++
+	if st.writeTimer != nil {
+		st.writeTimer.Stop()
+		st.writeTimer = nil
+	}
+	if !st.writeActive || st.writeDeadline.IsZero() || st.writeExpired {
+		return
+	}
+	epoch := st.writeEpoch
+	st.writeTimer = time.AfterFunc(time.Until(st.writeDeadline), func() {
+		s := st.session
+		s.mu.Lock()
+		if epoch != st.writeEpoch || !st.writeActive {
+			s.mu.Unlock()
+			return
+		}
+		st.writeExpired = true
+		f := st.writeFrame
+		if f == nil {
+			s.notify()
+			s.mu.Unlock()
+			return
+		}
+		if s.activeWriter == f {
+			s.mu.Unlock()
+			s.fail(os.ErrDeadlineExceeded)
+			return
+		}
+		for i, item := range s.out {
+			if item == f {
+				copy(s.out[i:], s.out[i+1:])
+				s.out[len(s.out)-1] = nil
+				s.out = s.out[:len(s.out)-1]
+				s.mu.Unlock()
+				s.releaseOutbound(f, os.ErrDeadlineExceeded)
+				return
+			}
+		}
+		s.mu.Unlock()
+	})
+}
+func (st *Stream) endWrite() {
+	s := st.session
+	s.mu.Lock()
+	st.writeActive = false
+	st.writeFrame = nil
+	st.armWriteDeadlineLocked()
+	s.mu.Unlock()
 }
 func (st *Stream) SetDeadline(t time.Time) error {
 	_ = st.SetReadDeadline(t)
@@ -129,10 +189,7 @@ func (st *Stream) Write(p []byte) (int, error) {
 	total := 0
 	for len(p) > 0 {
 		n := min(len(p), s.server.cfg.MaxFrameData)
-		s.mu.Lock()
-		deadline := st.writeDeadline
-		s.mu.Unlock()
-		if e := s.send(cmdPSH, st.id, p[:n], st, deadline); e != nil {
+		if e := s.send(cmdPSH, st.id, p[:n], st, time.Time{}); e != nil {
 			return total, e
 		}
 		total += n
@@ -160,11 +217,8 @@ func (st *Stream) WriteOwnedFrame(wire []byte, release func([]byte)) (int, error
 	st.wMu.Lock()
 	defer st.wMu.Unlock()
 	s := st.session
-	s.mu.Lock()
-	deadline := st.writeDeadline
-	s.mu.Unlock()
 	n := len(wire) - 7
-	if err := s.send(cmdPSH, st.id, wire[7:], st, deadline, outboundLease{wire, release}); err != nil {
+	if err := s.send(cmdPSH, st.id, wire[7:], st, time.Time{}, outboundLease{wire, release}); err != nil {
 		return 0, err
 	}
 	return n, nil

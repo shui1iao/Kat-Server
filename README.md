@@ -4,7 +4,7 @@
 
 # Kat
 
-Kat 是用 Go 编写的 Linux 纯正式入站+直连转发服务端代理内核，提供有界资源管理与 TCP/UDP 直连转发。当前版本 **0.8.1**，在 0.7.0 基础上修复 AnyTLS 旧会话授权撤销与 API/统计/选择状态热重载原子性，并增加 AnyTLS 入站自定义 padding 方案；既有功能、默认值和正式协议范围不变。命令名为 `kat`，模块名为 `github.com/shui1iao/Kat`。本项目不提供图形客户端、TUN 或公网管理接口；本机管理接口只监听 Unix socket 或回环地址。升级变化及限制见 [发布说明](RELEASE_NOTES.md)。
+Kat 是用 Go 编写的 Linux 纯正式入站+直连转发服务端代理内核，提供有界资源管理与 TCP/UDP 直连转发。当前版本 **0.8.1**，在 0.7.0 基础上修复 AnyTLS 旧会话授权撤销与 API/统计热重载原子性，并增加 AnyTLS 入站自定义 padding 方案；既有功能、默认值和正式协议范围不变。命令名为 `kat`，模块名为 `github.com/shui1iao/Kat`。本项目不提供图形客户端、TUN 或公网管理接口；本机管理接口只监听 Unix socket 或回环地址。升级变化及限制见 [发布说明](RELEASE_NOTES.md)。
 
 ## 入站协议范围
 
@@ -36,7 +36,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -o kat 
 ./kat run examples/socks5.json
 ```
 
-`version` 输出 `kat 0.7.1`。`check` 严格检查 JSON、未知字段、凭据组合、限额及 TLS 证书/私钥配对（AnyTLS 入站省略 `tls` 时，`check` 同样会在内存中生成一张随机证书，与之后 `run` 使用的不是同一张），但不建立监听、不联网。`run` 启动服务；收到 SIGINT/SIGTERM 后停止接入，在 `drain_timeout` 内等待，超时取消并回收。
+`version` 输出 `kat 0.8.1`。`check` 严格检查 JSON、未知字段、凭据组合、限额及 TLS 证书/私钥配对（AnyTLS 入站省略 `tls` 时，`check` 同样会在内存中生成一张随机证书，与之后 `run` 使用的不是同一张），但不建立监听、不联网。`run` 启动服务；收到 SIGINT/SIGTERM 后停止接入，在 `drain_timeout` 内等待，超时取消并回收。
 
 0.7.0 起另有管理子命令，用于查看和操作正在运行的实例，详见下文“日志、流量统计与管理接口”：
 
@@ -52,12 +52,12 @@ kat log level [debug|info|warn|error]  # 查看或切换日志级别
 
 首次构建需要准备 `go.mod`/`go.sum` 指定的依赖；依赖齐全后可以使用 `GOTOOLCHAIN=local GOPROXY=off GOFLAGS=-mod=readonly` 离线构建。源码未内置全部依赖缓存。
 
-[v0.7.1 Release](https://github.com/shui1iao/Kat/releases/tag/v0.7.1) 提供 [kat-0.7.1-linux-amd64](https://github.com/shui1iao/Kat/releases/download/v0.7.1/kat-0.7.1-linux-amd64)、对应 [.sha256](https://github.com/shui1iao/Kat/releases/download/v0.7.1/kat-0.7.1-linux-amd64.sha256) 及 [kat-0.7.1-third-party-licenses.txt](https://github.com/shui1iao/Kat/releases/download/v0.7.1/kat-0.7.1-third-party-licenses.txt) 许可附件。可先校验，再改为便于调用的名称：
+[v0.8.1 Release](https://github.com/shui1iao/Kat-Server/releases/tag/v0.8.1) 提供 [kat-0.8.1-linux-amd64](https://github.com/shui1iao/Kat-Server/releases/download/v0.8.1/kat-0.8.1-linux-amd64)、对应 [.sha256](https://github.com/shui1iao/Kat-Server/releases/download/v0.8.1/kat-0.8.1-linux-amd64.sha256) 及 [kat-0.8.1-third-party-licenses.txt](https://github.com/shui1iao/Kat-Server/releases/download/v0.8.1/kat-0.8.1-third-party-licenses.txt) 许可附件。可先校验，再改为便于调用的名称：
 
 ```sh
-sha256sum -c kat-0.7.1-linux-amd64.sha256
-chmod +x kat-0.7.1-linux-amd64
-./kat-0.7.1-linux-amd64 version
+sha256sum -c kat-0.8.1-linux-amd64.sha256
+chmod +x kat-0.8.1-linux-amd64
+./kat-0.8.1-linux-amd64 version
 ```
 
 ## 配置与示例
@@ -67,16 +67,16 @@ chmod +x kat-0.7.1-linux-amd64
 - 入站：`socks5.json`、`shadowsocks-2017.json`、`shadowsocks-2022.json`、`trojan-tls.json`、`anytls-tls.json`。
 - `runtime.json`：日志、访问日志、统计、连接明细、管理接口（含回环 TCP 监听与密钥）和 `security` 写法。
 
-0.7.0 起 Kat 默认拒绝被代理的流量访问本机回环地址（见下文“安全默认值”）。上面这些示例本来就只用于本机目标，因此入站示例和 `routing.json` 都写了 `"security": {"allow_loopback": true}`；部署到公网时请删掉这一项。
+0.7.0 起 Kat 默认拒绝被代理的流量访问本机回环地址（见下文“安全默认值”）。上面这些示例本来就只用于本机目标，因此这些入站示例写了 `"security": {"allow_loopback": true}`；部署到公网时请删掉这一项。
 
 通用字段：
 
 - `inbounds`：1–64 个入口；`protocol` 为协议标识，`listen` 为字面 IP 加端口，IPv6 使用 `[::1]:端口`。
 - SOCKS5 的 `users` 使用 `username`/`password`；非回环监听必须配置用户，配置后不回退为无认证。SOCKS5 本身不加密，也不支持 TLS 包装，不应作为未加密的公网服务。
 - Trojan 的 `users` 只使用 `password`，并且必须配置 `tls`。
-- AnyTLS 使用 `anytls.password`，不填 `users`。`tls` 可以省略：省略时 Kat 使用每次启动随机生成的自签证书（ECDSA P-256，名称为 `localhost`，只在内存中，不写盘），**客户端必须跳过证书校验**；证书每次重启都会变，无法固定指纹，也无法用 CA 校验，因此不能防范中间人。写了 `tls` 时需要成对的 `cert`/`key` 或有效 `acme` 配置；`tls` 写成 `null`、`{}` 或不完整文件配对会被拒绝。`max_sessions`、`max_streams`、`session_streams`、`stream_bytes`、`session_bytes`、`slow_timeout` 限制会话、逻辑流、缓冲和慢消费者，默认值见下文“AnyTLS 身份额度”。同密码的入口共享身份、预算及有效 padding 方案，冲突配置会被拒绝。
+- AnyTLS 使用 `anytls.password`，不填 `users`。`tls` 可以省略：省略时 Kat 使用每次启动随机生成的自签证书（ECDSA P-256，名称为 `localhost`，只在内存中，不写盘），这种临时证书不能提供可持续验证的服务端身份，只适合明确接受此限制的测试。远程部署应配置可验证的 `tls` 证书，不要在客户端关闭证书验证。写了 `tls` 时需要成对的 `cert`/`key` 或有效 `acme` 配置；`tls` 写成 `null`、`{}` 或不完整文件配对会被拒绝。`max_sessions`、`max_streams`、`session_streams`、`stream_bytes`、`session_bytes`、`slow_timeout` 限制会话、逻辑流、缓冲和慢消费者，默认值见下文“AnyTLS 身份额度”。同密码的入口共享身份、预算及有效 padding 方案，冲突配置会被拒绝。
 - Shadowsocks 使用 `ss.method` 及相应凭据，不填 `users` 或 `tls`。`ss.tcp_salts`、`ss.salts_2017`、`ss.sessions` 控制有界保护状态；填 0 表示默认，不是禁用校验。相同方法和实际密钥的入口共享身份、重放保护及 UDP 关联，保护设置必须一致。
-- `tls.cert`、`tls.key` 指向自行准备的证书和私钥，路径相对启动时的工作目录。Trojan/AnyTLS 入站示例需要先准备 `server.crt` 和 `server.key`（`anytls-tls.json` 演示的是自备证书写法）；`routing.json` 的 Trojan/AnyTLS 出站用同一份 `server.crt` 作为 `tls.ca`，证书需包含 `localhost`。仓库不附生产证书或私钥。
+- `tls.cert`、`tls.key` 指向自行准备的证书和私钥，路径相对启动时的工作目录。Trojan/AnyTLS 入站示例需要先准备 `server.crt` 和 `server.key`（`anytls-tls.json` 演示的是自备证书写法）。仓库不附生产证书或私钥。
 - `udp_bind_ipv4`、`udp_bind_ipv6` 可指定直连（direct）UDP 出站的本机源地址；省略时由系统路由选择。它们不是访问控制系统（目标地址限制见 `security`）。
 
 `limits` 的常用字段如下；计数或时长填 0/省略一般表示默认，`tcp_idle` 的 0 表示正式支持协议不启用该闲置超时。时长使用 `"5s"`、`"5m"` 等字符串。
@@ -89,7 +89,7 @@ chmod +x kat-0.7.1-linux-amd64
 | `udp_queue` / `udp_queue_bytes` | 16 / `udp_queue × 65507` | 每关联队列的包数与载荷字节预算 |
 | `udp_targets` | 256 | 每关联有效回包目标数 |
 | `buffer_size` / `pool_buffers` | 16384 / 128 | 普通复制缓冲大小与池缓存数量 |
-| `handshake_timeout` / `dial_timeout` | 10s / 5s | 握手与拨号超时；经代理出站时两者之和是拨号（含整条链路握手）的总预算 |
+| `handshake_timeout` / `dial_timeout` | 10s / 5s | 握手与拨号超时；分别限制入站握手和直连拨号 |
 | `drain_timeout` / `udp_idle` | 5s / 60s | 退出等待与 UDP 闲置超时；`udp_idle` 也用于代理 UDP 会话的空闲回收 |
 | `tcp_idle` | 0 | TCP 活动闲置超时，默认关闭 |
 | `disable_fast_path` | false | 强制使用普通缓冲复制路径 |
@@ -118,6 +118,8 @@ AnyTLS 身份额度（写在 `anytls` 对象内，同密码的入口共享）：
 | `stream_bytes` / `session_bytes` | 131072 / 1048576 | 单流 / 单会话的缓冲预算，入、出方向分别计费 |
 | `slow_timeout` | 60s（取值 1ms–60s） | 慢消费者及写入超时：缓冲满后等待对端读取的最长时间，超时关闭整个会话 |
 
+`max_sessions` 计入已完成密码与 settings 验证的会话。认证中的连接另有有界配额，仍受物理连接与握手超时约束。同密码的身份配额跨成功重载连续计数；较小的新上限不会强制踢掉已有会话。等待下一个帧的空闲载体可以复用；一旦开始读取帧头或帧体，物理读取受 `handshake_timeout` 限制。逻辑流写期限可更新；尚未发出的帧到期只取消该帧，已开始写入的帧则可能需要关闭载体，防止帧错位。
+
 默认额度按几位用户用 Surge、mihomo、sing-box 日常浏览、看视频、玩游戏的负载设定；超过额度时直接拒绝，不会无限占用内存。
 
 **内存说明。** 正常使用时 Kat 的内存占用不大：在本机回环上用 sing-box 或 mihomo 作客户端、几百个并发流（AnyTLS、Shadowsocks 2022、Trojan，含 UDP）测试，进程 RSS 峰值约 35–105 MiB；500 个 AnyTLS 会话各下载 4 MiB、客户端先暂停读取 6 秒的压力场景约 105–116 MiB。但默认值下字节型缓冲的理论上界较大：持有凭据的使用者如果刻意把所有队列都占满，单个 AnyTLS 身份时约 2.9 GiB（主要是 AnyTLS 会话缓冲 `min(max_sessions × 2 × session_bytes, max_streams × 2 × stream_bytes)` 约 1 GiB，`max_sessions` 默认跟随 `connections` 后由后一项决定；加上 UDP 关联队列 `udp_associations × udp_queue_bytes` 约 1 GiB；会话数上限变大后，每个会话不计入上式的固定开销合计最多约 0.1 GiB），每多一个使用默认额度的 AnyTLS 身份再增加约 1 GiB。2 GB 等内存较小的机器，或需要隔离不可信用户时，请在配置中显式填写更小的值，例如 `limits.udp_associations: 256`，以及 AnyTLS 的 `max_sessions: 128`、`max_streams: 1024`，这两项缓冲各降到约 256 MiB；也可以减小 `connections`（未填写的 `max_sessions` 随之变小）、`session_bytes`、`stream_bytes`。`slow_timeout` 不改变这些上界，只决定对端不读时缓冲最多被占用多久。
@@ -136,7 +138,7 @@ SS 原生 UDP 的闲置按“最后一次合法活动之后”计时：通过认
 
 0.5.19 复用 UDP 会话密码对象；0.5.20 将 UDP 解密和回包处理移出共享状态锁，并增加有界读取并发，不改变认证、重放窗口或目标回包限制。
 
-同身份多个监听入口共享 UDP 会话。来源迁移必须先通过认证与重放校验；回包目的始终使用最新认证来源。迁移期间可能短暂从旧监听入口发出回包，**不承诺回包源监听入口立即切换**。需要固定源端口的客户端或网络策略应考虑这一边界。
+同身份多个监听入口共享 UDP 会话。来源迁移必须先通过认证、重放及来源准入校验；回包目的始终使用最新认证来源。迁移期间可能短暂从旧监听入口发出回包，**不承诺回包源监听入口立即切换**。需要固定源端口的客户端或网络策略应考虑这一边界。
 
 ## 基础 DNS 与直连解析
 
@@ -162,7 +164,7 @@ Trojan/AnyTLS 入站支持证书文件跟随、reload 换证、ALPN、TLS 1.2/1.
 
 | 字段 | 默认值 | 作用 |
 | --- | --- | --- |
-| `level` | `info` | `debug` / `info` / `warn` / `error`。诊断类 `event=failure` 与各种 `*_failed` 为 `warn`；启动、监听、策略组切换、规则集加载等为 `info`；管理请求（`api_request`）、统计落盘（`stats_saved`）为 `debug` |
+| `level` | `info` | `debug` / `info` / `warn` / `error`。诊断类 `event=failure` 与各种 `*_failed` 为 `warn`；启动、监听、配置重载等为 `info`；管理请求（`api_request`）、统计落盘（`stats_saved`）为 `debug` |
 | `format` | `text` | `text` 或 `json`。`json` 时每行一个对象：`time`、`level`、`event` 及该事件的其余字段；不是 `kat event=` 形式的行放在 `msg` 字段 |
 | `file` | 空（stderr） | 绝对路径时写入该文件（文件权限 0600，目录不存在时按 0750 创建），文本格式每行前加 RFC 3339 时间 |
 | `max_size_mb` / `max_backups` | 10 / 3 | 写文件时按大小轮转：即将超过 `max_size_mb`（1–1024）时，`kat.log` → `kat.log.1` → … → `kat.log.N`，最多保留 `max_backups`（1–100）个旧文件 |
@@ -173,11 +175,11 @@ Trojan/AnyTLS 入站支持证书文件跟随、reload 换证、ALPN、TLS 1.2/1.
 **访问日志**（`log.access: true`）在每条连接结束时写一行（UDP 为每个关联一行），级别为 `info`、不做抑制，与诊断日志写到同一个输出：
 
 ```text
-kat event=access id=12 network=tcp inbound=shadowsocks/0.0.0.0:8388 src=203.0.113.0/24 dst=www.example.com:443 rule=domain_suffix:example.com->pick chain=pick>auto>node-a result=ok up=812 down=40213 duration_ms=5230
+kat event=access id=12 network=tcp inbound=shadowsocks/0.0.0.0:8388 src=203.0.113.0/24 dst=www.example.com:443 rule=final->direct chain=direct result=ok up=812 down=40213 duration_ms=5230
 ```
 
 - `src` 是客户端来源地址的截断前缀：IPv4 保留 /24，IPv6 保留 /48，不记录完整来源地址；`dst` 是客户端请求的完整目标（域名或 IP 加端口）。
-- `rule` 是命中的规则（见下文“名称”），`chain` 是经过的策略组和最终出站，`result` 为 `ok`、`blocked`（被 `security` 拒绝）、`rejected`（规则拒绝）、`dns_failed`、`dial_failed`、`closed_by_api`（被 `kat conns close` 断开）等。
+- `rule` 和 `chain` 在直连转发时分别为 `final->direct` 和 `direct`。`result` 记录成功、目标被安全策略拒绝、解析或拨号失败、管理接口关闭连接等结果。
 - `up`/`down` 是这条连接的有效载荷字节数（口径见下文）。UDP 关联的 `dst` 是该关联的第一个目标，`rule`/`chain` 是最近一次路由的结果。
 - 访问日志会记录目标地址，请按需开启并自行管理日志文件的保存和权限。日志级别设为 `warn` 或 `error` 时访问日志也不输出。
 
@@ -187,8 +189,8 @@ kat event=access id=12 network=tcp inbound=shadowsocks/0.0.0.0:8388 src=203.0.11
 
 - **全局**：累计上行/下行字节。
 - **每入站**：名称为 `协议/监听地址`，例如 `shadowsocks/0.0.0.0:8388`。
-- **每出站与每策略组**：名称即配置中的 `name`；内置 `direct`、`reject` 也列出。一条连接经过的策略组及最终选中的出站都会计入（例如 `pick>auto>node-a` 同时计入 `pick`、`auto`、`node-a`）；`via` 链式代理底层用来连接上游服务器的出站不重复计入。
-- **每条规则**：命中次数和流量。名称为 `条件:值->去向`，例如 `domain_suffix:example.com->pick`、`network:udp->direct`、`rule_set:block-list->reject`；未命中任何规则时记为 `final->去向`；带 `no_resolve` 的 IP 类规则写作 `ip_cidr:…,no_resolve->去向`；完全相同的规则再次出现时加 `#2`、`#3`。TCP 每条连接计一次命中，UDP 每个关联对每个不同目标计一次命中。命中后被拒绝或拨号失败的连接也计入命中次数，但没有流量。
+- **出站**：按 `direct` 统计直连流量。
+- **规则**：仅有 `final->direct` 这一条统计项；不支持自定义路由规则。
 - **当前连接数**：正在转发的 TCP 连接数、UDP 关联数，以及已接入的入站传输连接数（例如一个 AnyTLS 会话算一个，即使其中有多个逻辑流）；另有本次启动以来因额度被拒绝的入站连接数。
 - **实时速率**：最近约 5 秒的平均上行/下行速率（每秒采样一次）。
 
@@ -201,12 +203,12 @@ kat event=access id=12 network=tcp inbound=shadowsocks/0.0.0.0:8388 src=203.0.11
 | `save_interval` | `60s` | 落盘间隔，5s–24h |
 | `connections` | `false` | 活跃连接明细，见下文 |
 
-**持久化：** 累计值（全局、每入站、每出站、每组、每条规则）每隔 `save_interval` 写入一次，正常退出（SIGINT/SIGTERM）时再写一次；写入方式是同目录临时文件加原子改名，不会留下半个文件。启动时读回，因此**重启不会清零**；被强制杀死时最多丢失最近一个间隔的增量。
+**持久化：** 累计值（全局、各入站、直连出站与 `final->direct`）每隔 `save_interval` 写入一次，正常退出（SIGINT/SIGTERM）时再写一次；写入方式是同目录临时文件加原子改名，不会留下半个文件。启动时读回，因此**重启不会清零**；被强制杀死时最多丢失最近一个间隔的增量。
 
-- 持久化文件按名称保存各项计数，与配置中的顺序无关；重启后配置里已经不存在的入站、出站、组或规则，其旧计数会被丢弃。配置热重载不清零：总量、入站、出站、组按名称延续，规则按规则本身（上面的规则名称）延续。
+- 持久化文件按名称保存计数。重载保留总量及同名计数；已删除入站的历史项不会在新配置下单列。
 - 只做累计值，不按天保存历史。
 - 写入失败只告警（`kat event=stats_save_failed`，并计入 `kat stats` 的 `save_errors`），不影响转发。
-- 文件损坏或无法解析时告警（`kat event=stats_load_failed reason=corrupt`），把坏文件改名为 `原名.corrupt-时间` 保留，然后从零开始计数，不会退出。
+- 文件损坏或无法解析时告警（`kat event=stats_load_failed reason=corrupt`），把坏文件改名为 `原名.corrupt-时间` 保留，然后从零开始计数。若隔离失败，保留原件，并暂停向该目标写入；确认文件已处理后重启实例可重试。转发不退出。
 - 同一个统计文件同时只能被一个进程使用（旁边的 `.lock` 文件加锁）。另一个实例用到同一个文件时，它会告警（`stats_persist_disabled reason=file_in_use`）并只在内存中计数。
 - `kat stats reset` 把所有累计值清零、重新记录起始时间并立即落盘；当前连接的明细计数不受影响。
 
@@ -258,7 +260,7 @@ Kat 自有的 HTTP/JSON 接口（不兼容 Clash API，也不提供 Prometheus �
 | `allow_loopback` | `false` | `true` 时允许访问上述本机地址（0.6.3 的行为） |
 | `block_private` | `false` | `true` 时还拒绝私有与链路本地地址：`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`、`100.64.0.0/10`、`169.254.0.0/16`、`fc00::/7`、`fe80::/10` |
 
-- 只作用于客户端流量经 `direct` 的最终拨号（包括策略组里的 `direct` 成员）。Kat 自己发起的连接不受影响：DNS 查询、策略组测速、规则集与 GeoIP 下载，以及连接上游代理服务器（即使上游就在本机回环地址上）。经上游代理转发的目标由上游决定，Kat 不检查。
+- 限制作用于客户端流量的最终直连目标，不作用于 Kat 自己发起的 DNS 查询。
 - `allow_loopback: true` 时，回环地址上的服务（包括管理 TCP 端口）都可被客户端访问，管理 TCP 端口仍需要 `secret`。
 
 ```json
@@ -278,15 +280,15 @@ Kat 自有的 HTTP/JSON 接口（不兼容 Clash API，也不提供 Prometheus �
 
 - 两项默认关闭。启用封禁而省略参数时：固定 1 分钟窗口内失败 30 次，封禁 10 分钟；IPv4 按地址、IPv6 按 /64（并发上限相同）。并发上限计实际 TCP 连接，AnyTLS 会话不等同于逻辑流，UDP 关联不算 TCP 并发。
 - 认证失败：SS 首块解密失败、AnyTLS 密码哈希不符或 padding 超限、Trojan 的 56 位十六进制哈希不匹配、SOCKS5 用户名或密码错误。SS2017 无法区分错密码、错方法和随机探测；Trojan 非十六进制探测不计猜密。UDP 错误认证不计数，避免伪造源地址造成误封。
-- 封禁对所有新 TCP 连接和 SS 新 UDP 关联生效，不切断已有连接。每入站 `sources` 可写 `{"allow":["192.0.2.0/24"],"deny":["192.0.2.9"]}`，接受 IP/CIDR；黑名单优先，白名单非空时只接受其内来源。名单同样限制 SS 新 UDP 关联。
+- 封禁对所有新 TCP 连接和 SS 新 UDP 关联生效，不切断已有连接。每入站 `sources` 可写 `{"allow":["192.0.2.0/24"],"deny":["192.0.2.9"]}`，接受 IP/CIDR；黑名单优先，白名单非空时只接受其内来源。名单同样限制 SS 新 UDP 关联与 SS2022 迁移到的新来源。
 - 重载后新连接应用新名单/上限，已有连接保留；连接计数一直进行。封禁表跨重载保留，关闭封禁时清空（旧代迟到的认证失败也不能重新封禁），重启清空。
 - `kat bans [--json]` 查看，`kat bans remove SOURCE` 解封；IPv6 可传地址或 /64。API 为 `GET /v1/bans`、`DELETE /v1/bans/{source}`，权限同管理接口。CLI 显示完整来源，诊断日志只显示 IPv4 /24、IPv6 /48。
-- 失败来源/封禁表各最多 65536 条，满后不再新增并增加 `security.untracked_failures`；每秒清扫过期项。统计的 `security` 包含封禁/失败/来源数、三类安全拒绝及分片缓存字节。安全拒绝发生在握手额度前，**不计入** `connections.rejected_since_start`；后者只统计通用额度拒绝。
+- 失败来源/封禁表各最多 65536 条，满后不再新增并增加 `security.untracked_failures`；定时分批清理过期项，满表不在认证路径扫描。统计的 `security` 包含封禁/失败/来源数、三类安全拒绝及分片缓存字节。安全拒绝发生在握手额度前，**不计入** `connections.rejected_since_start`；后者只统计通用额度拒绝。
 - 私网默认放行，回环/未指定地址默认拒绝，管理回环接口因此受到保护；`allow_loopback`/`block_private` 的意义不变。
 
 ### Trojan fallback
 
-Trojan 入站可写 `"fallback":"127.0.0.1:8080"`（示例，须替换为自备网站），只接受字面 IP:端口。TLS 握手成功后非 Trojan 请求原样回落，包括已读字节；回落允许由 Kat 连接本机回环网站，不受客户端回环目标限制。拨号计入 dials，转发受 tcp_idle 限制；不可达时发送 TLS close_notify 并关闭。握手失败或一直不发送应用数据不会回落。
+Trojan 入站可写 `"fallback":"127.0.0.1:8080"`（示例，须替换为自备网站），只接受字面 IP:端口。TLS 握手成功后非 Trojan 请求原样回落，包括已读字节；一旦匹配到有效凭据，后续格式错误直接关闭，不向网站转发任何认证材料。回落允许由 Kat 连接本机回环网站，不受客户端回环目标限制。拨号计入 dials，转发受 tcp_idle 限制；不可达时发送 TLS close_notify 并关闭。握手失败或一直不发送应用数据不会回落。
 
 **时序变化：无论是否配置 fallback，读到第一个非法 Trojan 字节就立即判失败，不再等满 56 字节。** fallback 不保证对所有探测行为与普通网站完全相同。
 
@@ -311,15 +313,15 @@ UDP 分片重组默认开启：每关联缓存载荷最多 65535 字节，全局
 
 ### 原子性与失败处理
 
-重载分两步：先在不影响运行状态的情况下完整构建新配置（校验、DNS、出站、组、规则、规则集与 GeoIP 的本地文件、入站参数，以及新增地址的监听 socket），全部成功后才一次性切换。转发、日志、管理监听及统计/选择状态目标的准备阶段任何一步失败，整次重载作废，候选 socket 和锁全部释放，正在运行的配置、管理鉴权、统计路径/实例锁、累计值及运行选择保持原样；失败不消耗 generation。
+重载分两步：先在不影响运行状态的情况下完整构建新配置（校验、DNS、入站参数，以及新增地址的监听 socket），全部成功后才一次性切换。转发、日志、管理监听及统计目标的准备阶段任何一步失败，整次重载作废，候选 socket 和锁全部释放，正在运行的配置、管理鉴权、统计路径/实例锁、累计值保持原样；失败不消耗 generation。
 
-失败时 `kat reload` 以非零退出码结束，并输出 `kat: reload failed (阶段): 原因; the running configuration is unchanged`；日志记录 `kat event=reload_failed trigger=… stage=… reason=…`。阶段有 `load`（读文件或 JSON 语法错误，带行号）、`validate`（校验不通过）、`dns`、`routing`、`inbound`、`bind_tcp` / `bind_udp`（新端口被占用等）、`log`（新日志文件打不开）。SIGHUP 触发的重载失败只记日志。
+失败时 `kat reload` 以非零退出码结束，并输出 `kat: reload failed (阶段): 原因; the running configuration is unchanged`；日志记录 `kat event=reload_failed trigger=… stage=… reason=…`。阶段有 `load`（读文件或 JSON 语法错误，带行号）、`validate`（校验不通过）、`dns`、`inbound`、`bind_tcp` / `bind_udp`（新端口被占用等）、`log`（新日志文件打不开）。SIGHUP 触发的重载失败只记日志。
 
 ### 生效范围
 
-- **已有连接不受影响**：已建立的 TCP 连接和 UDP 关联继续使用建立时的那一代配置（路由结果、出站、组），直到自然结束；即使它使用的出站在新配置里被删除也一样，不会因为重载被强制断开。旧的一代配置按引用计数管理，最后一条连接结束后释放（关闭其出站、组的后台测速、规则集刷新和 DNS）。
+- **已有连接不受影响**：已建立的 TCP 连接和 UDP 关联继续使用接受它们的配置代；最后一个引用释放时，关闭该代 DNS 的空闲连接。
 - **新连接用新配置**：重载完成后建立的连接按新配置路由。
-- AnyTLS 会话（客户端会复用的长连接）中新开的逻辑流按当前配置路由并重新核对原监听的连续授权期。修改密码、删除入站、换监听或切换协议后，旧会话只拒绝新开的 TCP/UDP 流，已准入的流继续完成；之后恢复原配置不会让已撤销会话复活。无关规则、名称、预算和 padding 方案重载不撤销会话，新会话按新配置认证。
+- AnyTLS 会话（客户端会复用的长连接）中新开的逻辑流按当前配置路由并重新核对原监听的连续授权期。修改密码、删除入站、换监听或切换协议后，旧会话只拒绝新开的 TCP/UDP 流，已准入的流继续完成；之后恢复原配置不会让已撤销会话复活。名称、预算和 padding 方案重载不撤销会话，新会话按新配置认证。
 
 各部分的处理方式：
 
@@ -329,18 +331,18 @@ UDP 分片重组默认开启：每关联缓存载荷最多 65535 字节，全局
 | 删除入站 | 关闭监听，不再接收新连接；已有连接自然结束。Shadowsocks 的 UDP socket 在其上最后一个 UDP 关联结束后关闭 |
 | 地址和端口不变的入站 | 复用原来的监听 socket，不重新 bind，没有空窗；修改密码、方法、TLS、用户等参数只对新连接生效 |
 | 修改入站端口 | 新端口开始监听，旧端口停止接收新连接，旧连接自然结束 |
-| 出站、策略组、规则、规则集、GeoIP、DNS | 整体换成新配置。DNS 缓存清空；规则集和 GeoIP 从本地文件重新读入，配置了 `url` 的按新配置重新开始定时刷新；`url-test`、`fallback`、`smart` 组的测速和评分状态从头开始 |
+| `dns` | 新请求使用新配置与新缓存；既有连接及旧代中的请求不被中断 |
 | `limits` | 全局额度（`connections`、`handshakes`、`dials`、`udp_associations`、`logical_streams`）立即按新值生效；调低时不收回已占用的额度，只是新的申请要等用量降到新上限以下。其余额度和超时对新连接生效 |
 | `log` | `level`（见上文）、`access` 立即生效；`file`、`format`、轮转参数改变时换用新的输出，新文件打不开则整次重载失败 |
 | `security` | 对新连接立即生效 |
-| `stats` | `connections` 只影响之后建立的连接；`save_interval` 立即生效；新实例锁与统计/选择状态文件预备成功后才切换 `file` / `persist`，累计值及运行选择延续，不从新目标读回累计值 |
+| `stats` | `connections` 只影响之后建立的连接；`save_interval` 立即生效；新实例锁与统计文件预备成功后才切换 `file` / `persist`，累计值延续，不从新目标读回累计值 |
 | `api` | 新增监听先 bind、提交后才提供服务；不变地址复用监听并按每个请求更新 secret（含 keepalive）；撤下接口的在途请求安全完成，包括触发重载的请求 |
 
-**运行期资源准备：** 新管理 socket / 端口无法监听、双监听只部分成功、新统计实例锁被占用，或统计/选择状态目标无法写入或原子替换时，整次重载失败（`stage=api` / `stage=stats`），转发与管理/统计均不切换。预备不覆盖已有目标文件或删除别人的 socket。启动仍保持管理/统计失败仅告警、转发可继续的既有行为；提交后周期落盘的后续磁盘故障仍告警。这是进程内重载事务，不保证断电恢复或预知未来磁盘/外部文件修改故障。
+**运行期资源准备：** 新管理 socket / 端口无法监听、双监听只部分成功、新统计实例锁被占用，或统计目标无法写入或原子替换时，整次重载失败（`stage=api` / `stage=stats`），转发与管理/统计均不切换。预备不覆盖已有目标文件或删除别人的 socket。启动仍保持管理/统计失败仅告警、转发可继续的既有行为；提交后周期落盘的后续磁盘故障仍告警。这是进程内重载事务，不保证断电恢复或预知未来磁盘/外部文件修改故障。
 
 **授权提交边界：** 只有成功提交的重载才撤销受影响 AnyTLS 会话的新流准入；API/统计准备失败不会把仍生效的旧身份误撤销。撤销不强制关闭 carrier 或已经建立的流。
 
-**统计延续：** 重载不清零，总量、入站、出站、组按名称延续，规则按规则本身延续（同一条规则即使在列表中的位置变了，计数也继续）。
+**统计延续：** 重载不清零。总量、同名入站、`direct` 和 `final->direct` 统计项继续累计。
 
 ## 验证与性能口径
 

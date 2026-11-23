@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"errors"
 	"github.com/shui1iao/Kat/internal/ss"
-	"reflect"
 	"strings"
 )
 
@@ -77,49 +76,68 @@ func (o *SSOptions) validate() error {
 	return nil
 }
 
-// prepareEncrypted creates the SS codecs. A codec of the previous generation
-// with an identical configuration is reused, so replay windows, budgets and SS
-// UDP associations continue across a reload.
+// prepareEncrypted only stages policy. Reusing protection and routes is safe
+// even if a later prepare step fails: neither object is mutated here.
 func (s *Server) prepareEncrypted(prev *Server) error {
-	ssByID := map[string]*ssRuntime{}
-	ssOpts := map[string]SSOptions{}
-	var prevSS []*ssRuntime
+	previous := map[string]*ssRuntime{}
 	if prev != nil {
 		for _, in := range prev.cfg.Inbounds {
-			if in.ssRuntime != nil {
-				prevSS = append(prevSS, in.ssRuntime)
+			if rt := in.ssRuntime; rt != nil {
+				previous[rt.identity] = rt
 			}
 		}
 	}
+	runtimes := map[string]*ssRuntime{}
+	opts := map[string]SSOptions{}
 	for i := range s.cfg.Inbounds {
 		in := &s.cfg.Inbounds[i]
-		if in.Protocol == "shadowsocks" {
-			id, _ := in.SS.identity()
-			if prev, ok := ssOpts[id]; ok && prev.protection() != in.SS.protection() {
+		if in.Protocol != "shadowsocks" {
+			continue
+		}
+		id, err := in.SS.identity()
+		if err != nil {
+			return err
+		}
+		if rt := runtimes[id]; rt != nil {
+			if opts[id].protection() != in.SS.protection() {
 				return errors.New("same SS method/key must use identical protection settings")
 			}
-			rt := ssByID[id]
-			if rt == nil {
-				key, _ := in.SS.key()
-				conf := ss.Config{Method: in.SS.Method, Key: key, MaxTCPSalts: in.SS.TCPSalts, Max2017Salts: in.SS.Salts2017, MaxUDPSessions: in.SS.Sessions, UDPIdle: s.cfg.Limits.UDPIdle.value()}
-				for _, p := range prevSS {
-					if reflect.DeepEqual(p.conf, conf) {
-						rt = p
-						break
-					}
-				}
-				if rt == nil {
-					codec, e := ss.NewServer(conf)
-					if e != nil {
-						return errors.New("cannot initialize SS protection")
-					}
-					rt = &ssRuntime{codec: codec, conf: conf, v2022: strings.HasPrefix(in.SS.Method, "2022-"), associations: map[ssAssociationID]*ssNativeAssociation{}}
-				}
-				ssByID[id] = rt
-				ssOpts[id] = *in.SS
-			}
 			in.ssRuntime = rt
+			continue
 		}
+		conf := ss.Config{Method: in.SS.Method, MaxTCPSalts: in.SS.TCPSalts, Max2017Salts: in.SS.Salts2017, MaxUDPSessions: in.SS.Sessions, UDPIdle: s.cfg.Limits.UDPIdle.value()}
+		limits, err := conf.ProtectionLimits()
+		if err != nil {
+			return err
+		}
+		rt := previous[id]
+		if rt == nil {
+			conf.Key, err = in.SS.key()
+			if err != nil {
+				return err
+			}
+			codec, err := ss.NewServer(conf)
+			if err != nil {
+				return errors.New("cannot initialize SS protection")
+			}
+			rt = &ssRuntime{codec: codec, identity: id, limits: limits, v2022: strings.HasPrefix(conf.Method, "2022-"), ssRoutes: &ssRoutes{associations: map[ssAssociationID]*ssNativeAssociation{}}}
+		} else if rt.limits != limits {
+			staged := *rt // all mutable data remains behind shared pointers
+			staged.limits = limits
+			rt = &staged
+		}
+		in.ssRuntime = rt
+		runtimes[id] = rt
+		opts[id] = *in.SS
 	}
 	return nil
+}
+
+// Called only in the no-fail commit phase under bindMu, before rebinding.
+func (s *Server) commitSSProtection() {
+	for _, in := range s.cfg.Inbounds {
+		if rt := in.ssRuntime; rt != nil {
+			rt.codec.ApplyProtection(rt.limits)
+		}
+	}
 }
