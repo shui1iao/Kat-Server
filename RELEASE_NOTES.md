@@ -1,12 +1,22 @@
-# Kat-Server v0.8.1
+# Kat-Server v0.8.2
 
-仅发布，不自动部署或升级现有服务。命令 `kat`、Go 模块路径和 Linux 附件命名契约不变。同提交对应的独立 Windows 客户端内核发布于 `windows-core-v0.8.1`（`make_latest=false`）。
+Linux 服务端安全、稳定性与协议细节全面加固版。
 
-## 本版变化
-- **服务端与客户端职责分离精简**：`Kat-Server` 收敛为纯正式入站 + 直连转发（`direct`）服务端内核，移除实验性协议（VLESS/REALITY/Vision/XUDP/XHTTP/gRPC/WebSocket/HTTPUpgrade、Snell）以及仅客户端使用的代理出站、策略组、订阅 provider、路由规则集（SRS/MRS/GeoIP/GeoSite/ASN）与协议嗅探代码及对应第三方依赖；保留 SOCKS5、Shadowsocks 2017/2022、Trojan、AnyTLS 五类正式入站，以及直连 DNS、TLS/ACME/TFO、入站安全封禁、流量统计、管理 API 与原子热重载。
-- **配置边界显式校验**：服务端配置若包含客户端专属字段（`outbounds`、`groups`、`providers`、`routing`、`rule_sets`、`geoip`、`geosite`、`asn` 或入站 `sniff`），`kat check`、启动与重载均明确拒绝报错，不静默忽略。
-- **继承 v0.8.0 传输稳定性修复**：保持 TCP 转发半关闭静默收敛（`ECONNABORTED` 与单向正常 EOF 后另一方向 `quietFailure` 不误计失败）、AnyTLS 会话授权与热重载原子性。
-- **Windows Core `v0.8.1`（`windows-core-v0.8.1` Release）**：同步完成协议精简、规则集内存结构优化（紧凑后缀表 + 规则靶向编译）、HTTP 探测/订阅桥空闲连接回收、已完成 TUN 恢复账本 LUID/PID 复用退休修复，以及 AnyTLS 复用会话 0-RTT 开流、SS2022 客户端缓冲复用和 TUN 栈读写零分配优化（`sequence: 1794300002`）。
+## 本版更新
+- **Shadowsocks 安全与内存优化**：
+  - SS2017 盐表过期优先复用物理槽与空桶页，避免长期合法流量推动内存持续增长，同时不提前淘汰有效盐；
+  - 同方法、同密钥调参热重载保留未过期的防重放状态与 UDP 关联；
+  - SS2022 UDP 来源迁移前重检当前来源 ACL 与封禁状态；AES 双向活跃会话 ID 互斥防碰撞。
+- **Trojan fallback 凭据隔离**：
+  - 凭据匹配成功后若后续请求格式错误直接关闭连接，绝不将有效认证材料转发至普通网站后端。
+- **AnyTLS 并发与超时加固**：
+  - 拆分独立有界认证中额度，不占用正式 `MaxSessions` 槽位；同密码重载跨代共享身份计数；
+  - 已开始半帧增加物理读期限；逻辑流写期限支持动态更新/清除，未上线路帧到期仅撤回该帧。
+- **TLS / ACME / 统计与运维可靠性**：
+  - `check/start/reload/watch` 统一校验证书 `NotBefore`/`NotAfter`；
+  - ACME 按完整排序域名集合分目录并以单份 `0600 pair.pem` 原子切换证钥；
+  - Cloudflare `api_url` 要求 HTTPS 且禁止降级重定向；HTTP-01 webroot 在固定目录句柄下防符号链接校验；
+  - 损坏统计文件隔离失败时保留原件并暂停覆盖，传递目录 `Sync` 错误；UDP 多地址遇被禁候选继续尝试合法地址；认证失败表满时分批清理；清理 README 过期描述。
 
-## 验证与权利
-本次在 Hytron 完成 `Kat-Server` 全包单元测试与 `go vet`，以及 Linux amd64 静态二进制构建与 CLI 版本核验。自研代码保留所有权利，第三方组件继续遵循各自原许可（详见 `THIRD_PARTY_NOTICES.md` 与 `kat-0.8.1-third-party-licenses.txt`）。
+## 验证说明
+- Go 1.26.9 `go vet ./...` 0 诊断，`go test -race -count=1 ./...` 全包通过（590 通过、0 失败、4 外部互通/辅助跳过、0 race），`CGO_ENABLED=0 GOOS=linux GOARCH=amd64` 静态构建通过。
