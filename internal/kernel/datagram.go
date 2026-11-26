@@ -36,7 +36,7 @@ func (trojanDatagrams) ReadPacket(r io.Reader, _ Address) (packet, error) {
 		return packet{}, e
 	}
 	b, e := readDatagramBody(r, true)
-	return packet{a, b}, e
+	return packet{target: a, payload: b}, e
 }
 func (trojanDatagrams) AppendPacket(b []byte, a Address, p []byte) []byte {
 	b = appendAddress(b, a, false)

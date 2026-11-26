@@ -34,8 +34,8 @@ func TestDefaultLimitsValues(t *testing.T) {
 		{"udp_associations", l.UDPAssociations, 1024},
 		{"udp_targets", l.UDPTargets, 256},
 		// Unchanged defaults.
-		{"udp_queue", l.UDPQueue, 16},
-		{"udp_queue_bytes", l.UDPQueueBytes, 16 * maxDatagram},
+		{"udp_queue", l.UDPQueue, 128},
+		{"udp_queue_bytes", l.UDPQueueBytes, 128 * maxDatagram},
 		{"buffer_size", l.BufferSize, 16384},
 		{"pool_buffers", l.PoolBuffers, 128},
 	} {

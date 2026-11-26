@@ -10,13 +10,14 @@ import (
 
 // Full salt bytes, never a truncated digest: hashing only chooses a chain.
 // 32M entries cover >=61s * 2 *259375pps, with no early eviction. On-demand
-// chunks avoid a multi-GiB cold allocation. ALL identities share a2GiB raw
+// chunks avoid a multi-GiB cold allocation. ALL identities share a 2GiB raw
 // table budget; exhaustion fails closed. Cleanup returns budget only when an
 // unreachable chunk is reclaimed, not while any server can still access it.
 const default2017Salts = 32 * 1024 * 1024
 const compactBudget = int64(2 << 30)
 const compactChunkBits = 12
 const compactChunkSize = 1 << compactChunkBits
+const compactInitBucketBits = compactChunkBits // 4096 buckets (1 page = 16 KiB) initially
 const compactBucketBits = 23
 const compactBucketCount = 1 << compactBucketBits
 
@@ -58,16 +59,25 @@ type compactSaltStore struct {
 	free             uint32 // slot+1
 	spareBuckets     []*compactBuckets
 	keyLen           int
+	bucketBits       uint8
 	lastNow          int64
 	epoch            time.Time
 }
 
-func (c *compactSaltStore) init(n int) { *c = compactSaltStore{capacity: n, seed: maphash.MakeSeed()} }
+func (c *compactSaltStore) init(n int) {
+	*c = compactSaltStore{capacity: n, seed: maphash.MakeSeed(), bucketBits: compactInitBucketBits}
+}
+func (c *compactSaltStore) bits() uint8 {
+	if c.bucketBits == 0 {
+		return compactInitBucketBits
+	}
+	return c.bucketBits
+}
 func (c *compactSaltStore) at(slot uint32) *compactEntry {
 	return &c.pages[int(slot)>>compactChunkBits].data[int(slot)&(compactChunkSize-1)]
 }
 func (c *compactSaltStore) bucket(key []byte) uint32 {
-	return uint32(maphash.Bytes(c.seed, key)) & (compactBucketCount - 1)
+	return uint32(maphash.Bytes(c.seed, key)) & ((uint32(1) << c.bits()) - 1)
 }
 func (c *compactSaltStore) headAt(bucket uint32) *uint32 {
 	page := int(bucket) >> compactChunkBits
@@ -76,6 +86,71 @@ func (c *compactSaltStore) headAt(bucket uint32) *uint32 {
 	}
 	return &c.buckets[page].data[int(bucket)&(compactChunkSize-1)]
 }
+
+// growBuckets doubles the hash bucket table up to compactBucketBits while
+// reusing all existing bucket pages and respecting the shared 2 GiB budget.
+// If global budget cannot fund the extra pages, it returns cleanly with the
+// existing table intact.
+func (c *compactSaltStore) growBuckets() {
+	bits := c.bits()
+	if bits >= compactBucketBits {
+		return
+	}
+	newBits := bits + 1
+	newPages := 1 << (newBits - compactChunkBits)
+	existing := len(c.spareBuckets)
+	for _, p := range c.buckets {
+		if p != nil {
+			existing++
+		}
+	}
+	need := newPages - existing
+	if need > 0 {
+		size := int64(unsafe.Sizeof(compactBuckets{}))
+		for i := 0; i < need; i++ {
+			if !reserveCompact(size) {
+				return
+			}
+			p := new(compactBuckets)
+			runtime.AddCleanup(p, releaseCompact, size)
+			c.spareBuckets = append(c.spareBuckets, p)
+		}
+	}
+	for i, p := range c.buckets {
+		if p != nil {
+			clear(p.data[:])
+			p.live = 0
+			c.spareBuckets = append(c.spareBuckets, p)
+			c.buckets[i] = nil
+		}
+	}
+	c.buckets = make([]*compactBuckets, newPages)
+	c.bucketBits = newBits
+	mask := (uint32(1) << newBits) - 1
+	slot := c.head
+	for i := 0; i < c.count; i++ {
+		e := c.at(slot)
+		b := uint32(maphash.Bytes(c.seed, e.salt[:c.keyLen])) & mask
+		bp := int(b) >> compactChunkBits
+		page := c.buckets[bp]
+		if page == nil {
+			n := len(c.spareBuckets)
+			page = c.spareBuckets[n-1]
+			c.spareBuckets[n-1] = nil
+			c.spareBuckets = c.spareBuckets[:n-1]
+			c.buckets[bp] = page
+		}
+		head := &page.data[int(b)&(compactChunkSize-1)]
+		e.next = *head
+		*head = slot + 1
+		page.live++
+		if e.order == 0 {
+			break
+		}
+		slot = e.order - 1
+	}
+}
+
 func (c *compactSaltStore) expire(now time.Time) {
 	ns := now.Sub(c.epoch).Nanoseconds()
 	for c.count > 0 {
@@ -113,6 +188,9 @@ func (c *compactSaltStore) admit(salt []byte, now time.Time) error {
 	if c.keyLen != 0 && len(salt) != c.keyLen {
 		return ErrFormat
 	}
+	if c.bucketBits == 0 {
+		c.bucketBits = compactInitBucketBits
+	}
 	c.expire(now)
 	var key [32]byte
 	copy(key[:], salt)
@@ -129,7 +207,7 @@ func (c *compactSaltStore) admit(salt []byte, now time.Time) error {
 		return ErrCapacity
 	}
 	if c.buckets == nil {
-		c.buckets = make([]*compactBuckets, compactBucketCount/compactChunkSize)
+		c.buckets = make([]*compactBuckets, 1<<(c.bucketBits-compactChunkBits))
 	}
 	bp := int(bucket) >> compactChunkBits
 	if c.buckets[bp] == nil {
@@ -195,5 +273,8 @@ func (c *compactSaltStore) admit(salt []byte, now time.Time) error {
 	c.buckets[bp].live++
 	c.keyLen = len(salt)
 	c.count++
+	if c.bucketBits < compactBucketBits && c.count >= (1<<c.bucketBits)*2 {
+		c.growBuckets()
+	}
 	return nil
 }

@@ -17,10 +17,12 @@ type Address struct {
 func (a Address) String() string                 { return net.JoinHostPort(a.Host, strconv.Itoa(int(a.Port))) }
 func (a Address) MarshalBinary() ([]byte, error) { return a.marshal(false) }
 func (a Address) marshal(uot bool) ([]byte, error) {
+	return a.appendMarshal(nil, uot)
+}
+func (a Address) appendMarshal(b []byte, uot bool) ([]byte, error) {
 	if a.Host == "" || strings.ContainsRune(a.Host, 0) {
 		return nil, ErrProtocol
 	}
-	var b []byte
 	ip, e := netip.ParseAddr(a.Host)
 	if e == nil {
 		if ip.Zone() != "" {
@@ -33,14 +35,15 @@ func (a Address) marshal(uot bool) ([]byte, error) {
 				typ = 0
 			}
 			v := ip.As4()
-			b = append([]byte{typ}, v[:]...)
+			b = append(b, typ, v[0], v[1], v[2], v[3])
 		} else {
 			typ := byte(4)
 			if uot {
 				typ = 1
 			}
 			v := ip.As16()
-			b = append([]byte{typ}, v[:]...)
+			b = append(b, typ)
+			b = append(b, v[:]...)
 		}
 	} else {
 		if len(a.Host) > 255 {
@@ -50,7 +53,8 @@ func (a Address) marshal(uot bool) ([]byte, error) {
 		if uot {
 			typ = 2
 		}
-		b = append([]byte{typ, byte(len(a.Host))}, a.Host...)
+		b = append(b, typ, byte(len(a.Host)))
+		b = append(b, a.Host...)
 	}
 	return binary.BigEndian.AppendUint16(b, a.Port), nil
 }
@@ -82,7 +86,8 @@ func readAddress(r io.Reader, uot bool) (Address, error) {
 	default:
 		return Address{}, ErrProtocol
 	}
-	b := make([]byte, n+2)
+	var buf [257]byte
+	b := buf[:n+2]
 	if _, e := io.ReadFull(r, b); e != nil {
 		return Address{}, unexpected(e)
 	}

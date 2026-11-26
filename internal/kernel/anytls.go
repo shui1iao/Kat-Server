@@ -195,13 +195,29 @@ func (s *Server) serveAnyTLS(parent context.Context, c net.Conn, in Inbound) {
 				if len(b) > maxDatagram && e == nil {
 					e = errors.New("AnyTLS UDP exceeds native UDP maximum")
 				}
-				return packet{Address{a.Host, a.Port}, b}, e
+				return packet{target: Address{a.Host, a.Port}, payload: b}, e
 			}, UDPWrite: func(a Address, b []byte) error {
 				from := A.Address{Host: a.Host, Port: a.Port}
 				if udp.Connected() {
 					from = udp.Target()
 				}
 				return udp.WritePacket(from, b)
+			}, UDPWriteBatch: func(as []Address, bs [][]byte) error {
+				var fromsBuf [udpMmsgBatchSize]A.Address
+				froms := fromsBuf[:0]
+				if len(as) > len(fromsBuf) {
+					froms = make([]A.Address, 0, len(as))
+				}
+				connMode := udp.Connected()
+				connTgt := udp.Target()
+				for _, a := range as {
+					if connMode {
+						froms = append(froms, connTgt)
+					} else {
+						froms = append(froms, A.Address{Host: a.Host, Port: a.Port})
+					}
+				}
+				return udp.WritePacketBatch(froms, bs)
 			}}
 			if e := s.serveUDP(stream, q); !quietFailure(e) {
 				s.failure(failUDPIO, in.Protocol, in.logIndex)

@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -24,7 +25,7 @@ type ssRuntime struct {
 	*ssRoutes // shared across generations for the same identity
 }
 type ssRoutes struct {
-	mu           sync.Mutex
+	mu           sync.RWMutex
 	associations map[ssAssociationID]*ssNativeAssociation
 }
 
@@ -35,6 +36,8 @@ type ssRoutes struct {
 type ssUDPListener struct {
 	key      string
 	socket   *net.UDPConn
+	raw      syscall.RawConn
+	v6Socket bool
 	bind     atomic.Pointer[udpBinding]
 	draining atomic.Bool
 	assocs   atomic.Int64 // live associations created on this socket
@@ -43,10 +46,16 @@ type ssUDPListener struct {
 	rcvbufBefore, rcvbufActual int
 	rcvbufInitial              int64
 	rcvbufCharge               atomic.Int64
+	lastWriteDL                atomic.Int64
 }
 
 // releaseRcvBuf returns this listener's charge once; concurrent/duplicate calls are no-ops.
 func (l *ssUDPListener) releaseRcvBuf() { returnSSRcvBuf(l.rcvbufCharge.Swap(0)) }
+
+type ssReplyState struct {
+	capability *ss.Packet
+	listener   *ssUDPListener
+}
 
 type ssNativeAssociation struct {
 	a          *udpAssociation
@@ -54,6 +63,7 @@ type ssNativeAssociation struct {
 	id         ssAssociationID
 	capability *ss.Packet
 	listener   *ssUDPListener
+	replyState atomic.Pointer[ssReplyState]
 	origin     *ssUDPListener // socket the association was created on
 }
 
@@ -77,7 +87,8 @@ func (s *Server) listenSSUDP(in Inbound, bound net.Addr) (*ssUDPListener, error)
 	if e != nil {
 		return nil, e
 	}
-	l := &ssUDPListener{socket: u}
+	raw, _ := u.SyscallConn()
+	l := &ssUDPListener{socket: u, raw: raw, v6Socket: isIPv6UDPSocket(u)}
 	l.bind.Store(&udpBinding{g: s, idx: in.logIndex, runtime: in.ssRuntime})
 	if in.SS != nil && in.SS.UDPRcvBuf2017 != 0 {
 		if in.ssRuntime.v2022 {
@@ -119,10 +130,39 @@ func (k *core) loopSSUDP(l *ssUDPListener) {
 	k.readSSUDP(l)
 }
 func (k *core) readSSUDP(l *ssUDPListener) {
-	wire := make([]byte, 65535)
-	defer clear(wire)
+	rb := acquireUDPRecvBatch()
+	defer releaseUDPRecvBatch(rb)
+	var (
+		sb         udpSendBatch
+		fastAssoc  *ssNativeAssociation
+		fastTgts   [udpMmsgBatchSize]Address
+		fastPays   [udpMmsgBatchSize][]byte
+		fastPooled [udpMmsgBatchSize][]byte
+		fastNow    time.Time
+		fastN      int
+	)
+	flushFast := func() {
+		if fastN == 0 {
+			return
+		}
+		if fastAssoc.a.tryDirectForwardBatch(fastTgts[:fastN], fastPays[:fastN], fastNow, &sb) {
+			for i := 0; i < fastN; i++ {
+				putUDPPlainBuf(fastPooled[i])
+				fastPooled[i] = nil
+				fastPays[i] = nil
+			}
+		} else {
+			for i := 0; i < fastN; i++ {
+				fastAssoc.a.enqueue(packet{target: fastTgts[i], payload: fastPays[i], pooled: fastPooled[i]})
+				fastPooled[i] = nil
+				fastPays[i] = nil
+			}
+		}
+		fastAssoc = nil
+		fastN = 0
+	}
 	for {
-		n, source, e := l.socket.ReadFromUDPAddrPort(wire)
+		cnt, e := readUDPBatch(l.socket, l.raw, rb)
 		b := l.bind.Load()
 		s := b.g
 		logIndex := b.idx
@@ -132,7 +172,13 @@ func (k *core) readSSUDP(l *ssUDPListener) {
 			}
 			return
 		}
-		source = netip.AddrPortFrom(source.Addr().Unmap(), source.Port())
+		for idx := 0; idx < cnt; idx++ {
+			wire := rb.bufs[idx]
+			n := rb.lens[idx]
+			source := rb.addrs[idx]
+			if !source.IsValid() {
+				continue
+			}
 		if n > maxDatagram || !s.handSlots.try() {
 			s.counters.Dropped.Add(1)
 			if n > maxDatagram {
@@ -143,36 +189,78 @@ func (k *core) readSSUDP(l *ssUDPListener) {
 			continue
 		}
 		rt := b.runtime
+		var decBuf []byte
+		if n <= udpSmallBufCap {
+			decBuf = getUDPPlainBuf()
+		}
 		var p *ss.Packet
 		if rt.v2022 {
 			var refused bool
-			p, e, refused = k.decodeSS2022OnBinding(l, b, wire[:n], source)
+			p, e, refused = k.decodeSS2022OnBinding(l, b, decBuf, wire[:n], source)
 			if refused {
+				putUDPPlainBuf(decBuf)
 				s.handSlots.release()
 				s.counters.Dropped.Add(1)
 				continue
 			}
 		} else {
-			p, e = rt.codec.DecodeUDP(wire[:n], source)
+			p, e = rt.codec.DecodeUDPTo(decBuf, wire[:n], source)
 		}
 		s.handSlots.release()
 		if e != nil {
+			putUDPPlainBuf(decBuf)
 			s.counters.Dropped.Add(1)
 			s.failure(failUDPInvalid, "shadowsocks", logIndex)
 			continue
 		}
-		rt.mu.Lock()
-		if s.nativeContext.Err() != nil {
-			rt.mu.Unlock()
-			s.counters.Dropped.Add(1)
-			continue
+		payload := p.Payload
+		// Detach payload slice from capability so capability never aliases pooled memory.
+		p.Payload = nil
+		var pooled []byte
+		if decBuf != nil && cap(payload) <= cap(decBuf) {
+			pooled = decBuf
+		} else if decBuf != nil {
+			putUDPPlainBuf(decBuf)
 		}
 		id := ssAssociationID{source: source}
 		if rt.v2022 {
 			id = ssAssociationID{session: p.ClientSessionID}
 		}
+		now := p.AuthenticatedAt()
+		// Steady-state fast path under RLock: avoids exclusive lock contention
+		// between parallel SS UDP readers and outbound replies.
+		rt.mu.RLock()
+		if s.nativeContext.Err() == nil {
+			if assoc := rt.associations[id]; assoc != nil && assoc.a.ctx.Err() == nil && !assoc.a.ssIdleExpired(now) {
+				if st := assoc.replyState.Load(); st == nil || st.listener != l {
+					assoc.replyState.Store(&ssReplyState{capability: p, listener: l})
+				}
+				assoc.a.touchSSActivity(now)
+				rt.mu.RUnlock()
+				if fastAssoc != nil && fastAssoc != assoc {
+					flushFast()
+				}
+				fastAssoc = assoc
+				fastNow = now
+				fastTgts[fastN] = Address{p.Target.Host, p.Target.Port}
+				fastPays[fastN] = payload
+				fastPooled[fastN] = pooled
+				fastN++
+				continue
+			}
+		}
+		rt.mu.RUnlock()
+		flushFast()
+
+		rt.mu.Lock()
+		if s.nativeContext.Err() != nil {
+			rt.mu.Unlock()
+			putUDPPlainBuf(pooled)
+			s.counters.Dropped.Add(1)
+			continue
+		}
 		assoc := rt.associations[id]
-		if assoc != nil && (assoc.a.ctx.Err() != nil || assoc.a.ssIdleExpired(time.Now())) {
+		if assoc != nil && (assoc.a.ctx.Err() != nil || assoc.a.ssIdleExpired(now)) {
 			assoc.a.cancel()
 			delete(rt.associations, id)
 			assoc = nil
@@ -182,6 +270,7 @@ func (k *core) readSSUDP(l *ssUDPListener) {
 			// removed (draining) socket accepts no new association.
 			if !rt.v2022 && s.udpSourceRefused(source.Addr(), logIndex) {
 				rt.mu.Unlock()
+				putUDPPlainBuf(pooled)
 				s.counters.Dropped.Add(1)
 				continue
 			}
@@ -193,11 +282,13 @@ func (k *core) readSSUDP(l *ssUDPListener) {
 			k.bindMu.RUnlock()
 			if !ok {
 				rt.mu.Unlock()
+				putUDPPlainBuf(pooled)
 				s.counters.Dropped.Add(1)
 				continue
 			}
 			if !s.udpSlots.try() {
 				rt.mu.Unlock()
+				putUDPPlainBuf(pooled)
 				s.counters.Dropped.Add(1)
 				s.failure(failUDPBudget, "shadowsocks", logIndex)
 				s.unref()
@@ -213,15 +304,17 @@ func (k *core) readSSUDP(l *ssUDPListener) {
 				f.end("udp_socket_failed")
 				s.udpSlots.release()
 				rt.mu.Unlock()
+				putUDPPlainBuf(pooled)
 				s.counters.Dropped.Add(1)
 				s.failure(failUDPIO, "shadowsocks", logIndex)
 				s.unref()
 				continue
 			}
-			a.activity.Store(p.AuthenticatedAt().UnixNano())
+			a.activity.Store(now.UnixNano())
 			assoc = &ssNativeAssociation{a: a, runtime: rt, id: id, origin: l}
 			l.assocs.Add(1)
 			a.writeBack = assoc.reply
+			a.writeBackBatch = assoc.replyBatch
 			rt.associations[id] = assoc
 			s.counters.UDP.Add(1)
 			s.wg.Add(1)
@@ -229,17 +322,20 @@ func (k *core) readSSUDP(l *ssUDPListener) {
 		}
 		assoc.capability = p
 		assoc.listener = l
+		assoc.replyState.Store(&ssReplyState{capability: p, listener: l})
 		// Only a fully authenticated, fresh, formatted request reaches here.
-		assoc.a.touchSSActivity(p.AuthenticatedAt())
-		assoc.a.enqueue(packet{Address{p.Target.Host, p.Target.Port}, p.Payload})
+		assoc.a.touchSSActivity(now)
+		assoc.a.enqueue(packet{target: Address{p.Target.Host, p.Target.Port}, payload: payload, pooled: pooled})
 		rt.mu.Unlock()
+		}
+		flushFast()
 	}
 }
 
 // A live binding authorizes peer migration under its current ACL. Holding
 // bindMu through authentication/commit linearizes that decision with reload.
 // The steady state does not take the association lock during authentication.
-func (k *core) decodeSS2022OnBinding(l *ssUDPListener, b *udpBinding, wire []byte, source netip.AddrPort) (*ss.Packet, error, bool) {
+func (k *core) decodeSS2022OnBinding(l *ssUDPListener, b *udpBinding, dst, wire []byte, source netip.AddrPort) (*ss.Packet, error, bool) {
 	draining := l.draining.Load()
 	rt := b.runtime
 	if draining {
@@ -255,16 +351,20 @@ func (k *core) decodeSS2022OnBinding(l *ssUDPListener, b *udpBinding, wire []byt
 		return nil, nil, true
 	}
 	if draining {
-		p, err := rt.codec.DecodeEstablishedUDP(wire, source, func(id uint64) *ss.Packet {
+		p, err := rt.codec.DecodeEstablishedUDPTo(dst, wire, source, func(id uint64) *ss.Packet {
 			n := rt.associations[ssAssociationID{session: id}]
-			if n == nil || n.listener != l || n.a.ctx.Err() != nil || n.a.ssIdleExpired(time.Now()) {
+			if n == nil || n.a.ctx.Err() != nil || n.a.ssIdleExpired(time.Now()) {
 				return nil
 			}
-			return n.capability
+			st := n.replyState.Load()
+			if st == nil || st.listener != l {
+				return nil
+			}
+			return st.capability
 		})
 		return p, err, false
 	}
-	p, err := rt.codec.DecodeUDP(wire, source)
+	p, err := rt.codec.DecodeUDPTo(dst, wire, source)
 	return p, err, false
 }
 
@@ -279,6 +379,10 @@ func (a *udpAssociation) openOutbound() error {
 	if e != nil && s.cfg.UDPBindIPv6 != "" {
 		a.outbound4.Close()
 		return e
+	}
+	a.raw4, _ = a.outbound4.SyscallConn()
+	if a.outbound6 != nil {
+		a.raw6, _ = a.outbound6.SyscallConn()
 	}
 	a.activity.Store(time.Now().UnixNano())
 	return nil
@@ -304,6 +408,7 @@ func (s *Server) runSSAssociation(n *ssNativeAssociation) {
 			select {
 			case p := <-a.queue:
 				a.queuedBytes.Add(-int64(len(p.payload)))
+				releasePacket(p)
 			default:
 				s.counters.UDP.Add(-1)
 				s.udpSlots.release()
@@ -349,18 +454,27 @@ func (s *Server) runSSAssociation(n *ssNativeAssociation) {
 	}
 }
 func (n *ssNativeAssociation) reply(from Address, payload []byte) error {
-	n.runtime.mu.Lock()
 	if n.a.ctx.Err() != nil {
-		n.runtime.mu.Unlock()
 		return context.Canceled
 	}
-	capability, listener := n.capability, n.listener
-	// Encode and socket I/O never hold the routing lock. SS2017 Packet.source is
-	// immutable. For SIP022 (0.5.20) the codec still picks the latest
-	// authenticated peer and response counter atomically under its own mutex;
-	// only the listener snapshot may briefly lag a concurrent migration.
-	n.runtime.mu.Unlock()
-	wire, peer, e := n.runtime.codec.EncodeUDP(capability, ss.Address{Host: from.Host, Port: from.Port}, payload)
+	var capability *ss.Packet
+	var l *ssUDPListener
+	if st := n.replyState.Load(); st != nil {
+		capability, l = st.capability, st.listener
+	} else {
+		n.runtime.mu.RLock()
+		capability, l = n.capability, n.listener
+		n.runtime.mu.RUnlock()
+	}
+	if l == nil {
+		return errors.New("missing authenticated SS listener")
+	}
+	var encBuf []byte
+	if len(payload)+320 <= udpSmallBufCap {
+		encBuf = getUDPPlainBuf()
+		defer putUDPPlainBuf(encBuf)
+	}
+	wire, peer, e := n.runtime.codec.EncodeUDPTo(encBuf, capability, ss.Address{Host: from.Host, Port: from.Port}, payload)
 	if e != nil {
 		return e
 	}
@@ -368,12 +482,166 @@ func (n *ssNativeAssociation) reply(from Address, payload []byte) error {
 		n.a.server.counters.Dropped.Add(1)
 		return nil
 	}
-	// The authenticated codec, not the association's original source, chooses peer.
-	l := listener
+	dialTimeout := n.a.server.cfg.Limits.DialTimeout.value()
+	now := time.Now()
+	nowNano := now.UnixNano()
+	if iv := deadlineRefreshInterval(dialTimeout); iv == 0 {
+		l.socket.SetWriteDeadline(now.Add(dialTimeout))
+	} else {
+		last := l.lastWriteDL.Load()
+		if nowNano-last >= iv && l.lastWriteDL.CompareAndSwap(last, nowNano) {
+			l.socket.SetWriteDeadline(now.Add(dialTimeout))
+		}
+	}
+	_, e = l.socket.WriteToUDPAddrPort(wire, peer)
+	return e
+}
+
+func (n *ssNativeAssociation) replyBatch(froms []Address, payloads [][]byte) error {
+	if len(payloads) == 0 {
+		return nil
+	}
+	if len(payloads) == 1 {
+		return n.reply(froms[0], payloads[0])
+	}
+	if n.a.ctx.Err() != nil {
+		return context.Canceled
+	}
+	var capability *ss.Packet
+	var l *ssUDPListener
+	if st := n.replyState.Load(); st != nil {
+		capability, l = st.capability, st.listener
+	} else {
+		n.runtime.mu.RLock()
+		capability, l = n.capability, n.listener
+		n.runtime.mu.RUnlock()
+	}
 	if l == nil {
 		return errors.New("missing authenticated SS listener")
 	}
-	l.socket.SetWriteDeadline(time.Now().Add(n.a.server.cfg.Limits.DialTimeout.value()))
-	_, e = l.socket.WriteToUDPAddrPort(wire, peer)
+	var (
+		encBufs  [udpMmsgBatchSize][]byte
+		wires    [udpMmsgBatchSize][]byte
+		peers    [udpMmsgBatchSize]netip.AddrPort
+		sb       udpSendBatch
+		numWires int
+	)
+	defer func() {
+		for i := 0; i < len(payloads) && i < udpMmsgBatchSize; i++ {
+			if encBufs[i] != nil {
+				putUDPPlainBuf(encBufs[i])
+			}
+		}
+	}()
+	for i := 0; i < len(payloads); i++ {
+		payload := payloads[i]
+		var encBuf []byte
+		if len(payload)+320 <= udpSmallBufCap && i < udpMmsgBatchSize {
+			encBuf = getUDPPlainBuf()
+			encBufs[i] = encBuf
+		}
+		wire, peer, e := n.runtime.codec.EncodeUDPTo(encBuf, capability, ss.Address{Host: froms[i].Host, Port: froms[i].Port}, payload)
+		if e != nil {
+			return e
+		}
+		if len(wire) > maxDatagram {
+			n.a.server.counters.Dropped.Add(1)
+			continue
+		}
+		wires[numWires] = wire
+		peers[numWires] = peer
+		numWires++
+	}
+	if numWires == 0 {
+		return nil
+	}
+	dialTimeout := n.a.server.cfg.Limits.DialTimeout.value()
+	now := time.Now()
+	nowNano := now.UnixNano()
+	if iv := deadlineRefreshInterval(dialTimeout); iv == 0 {
+		l.socket.SetWriteDeadline(now.Add(dialTimeout))
+	} else {
+		last := l.lastWriteDL.Load()
+		if nowNano-last >= iv && l.lastWriteDL.CompareAndSwap(last, nowNano) {
+			l.socket.SetWriteDeadline(now.Add(dialTimeout))
+		}
+	}
+	_, e := writeUDPBatch(l.socket, l.raw, l.v6Socket, &sb, wires[:numWires], peers[:numWires])
 	return e
+}
+
+// tryDirectForwardBatch sends a batch of already-decoded steady-state SS UDP
+// payloads directly via sendmmsg when the target IP is already authorized and
+// the association queue is empty, eliminating the a.queue channel hop.
+func (a *udpAssociation) tryDirectForwardBatch(targets []Address, payloads [][]byte, now time.Time, sb *udpSendBatch) bool {
+	if len(payloads) == 0 || len(a.queue) > 0 || a.ctx.Err() != nil {
+		return false
+	}
+	var (
+		ips [udpMmsgBatchSize]netip.AddrPort
+		rts [udpMmsgBatchSize]*udpRoute
+		is6 bool
+	)
+	idle := a.server.cfg.Limits.UDPIdle.value()
+	for i, tgt := range targets {
+		if tgt.Port == 0 {
+			return false
+		}
+		ip, err := netip.ParseAddr(tgt.Host)
+		if err != nil {
+			return false
+		}
+		ip = ip.Unmap()
+		if i == 0 {
+			is6 = ip.Is6()
+		} else if ip.Is6() != is6 {
+			return false
+		}
+		ips[i] = netip.AddrPortFrom(ip, tgt.Port)
+	}
+	sock := a.outbound4
+	raw := a.raw4
+	if is6 {
+		sock = a.outbound6
+		raw = a.raw6
+	}
+	if sock == nil {
+		return false
+	}
+	a.mu.Lock()
+	for i := 0; i < len(payloads); i++ {
+		last, ok := a.allowed[ips[i]]
+		if !ok || now.Sub(last) > idle {
+			a.mu.Unlock()
+			return false
+		}
+		a.allowed[ips[i]] = now
+		rts[i] = a.routes[ips[i]]
+	}
+	a.mu.Unlock()
+
+	dialTimeout := a.server.cfg.Limits.DialTimeout.value()
+	nowNano := now.UnixNano()
+	iv := deadlineRefreshInterval(dialTimeout)
+	a.outputMu.Lock()
+	dlPtr := &a.lastOutWriteDL4
+	if is6 {
+		dlPtr = &a.lastOutWriteDL6
+	}
+	if iv == 0 || nowNano-*dlPtr >= iv {
+		sock.SetWriteDeadline(now.Add(dialTimeout))
+		*dlPtr = nowNano
+	}
+	sent, e := writeUDPBatch(sock, raw, is6, sb, payloads, ips[:len(payloads)])
+	a.outputMu.Unlock()
+	for i := 0; i < sent; i++ {
+		if a.flow != nil {
+			a.flow.udpUp(rts[i], len(payloads[i]))
+		}
+	}
+	if e != nil {
+		a.server.counters.Dropped.Add(int64(len(payloads) - sent))
+		a.server.failure(failUDPIO, "udp", -1)
+	}
+	return true
 }

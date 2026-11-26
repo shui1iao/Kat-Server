@@ -13,6 +13,8 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
+var zeroNonce12 [12]byte
+
 // Packet owns its plaintext Payload. It contains no aliases to input or other
 // packets. The unexported capability authorizes replies only on the originating
 // Server/session. Modifying public metadata does not change the replay state.
@@ -37,7 +39,13 @@ func (p *Packet) AuthenticatedAt() time.Time { return p.receivedAt }
 // A session is keyed by this Server's key + protocol client-session-ID, not source.
 // Source must identify an already received datagram; no DNS/network I/O occurs.
 func (s *Server) DecodeUDP(wire []byte, source netip.AddrPort) (*Packet, error) {
-	return s.decodeUDP(wire, source, nil)
+	return s.decodeUDP(nil, wire, source, nil)
+}
+
+// DecodeUDPTo decodes into caller-provided dst (when non-nil) so hot relays can
+// pool plaintext storage without altering DecodeUDP ownership semantics.
+func (s *Server) DecodeUDPTo(dst, wire []byte, source netip.AddrPort) (*Packet, error) {
+	return s.decodeUDP(dst, wire, source, nil)
 }
 
 // DecodeEstablishedUDP is for a draining SIP022 listener, which no longer has
@@ -47,14 +55,22 @@ func (s *Server) DecodeEstablishedUDP(wire []byte, source netip.AddrPort, existi
 	if !s.m.v2022 || existing == nil {
 		return nil, ErrSessionExpired
 	}
-	return s.decodeUDP(wire, source, existing)
+	return s.decodeUDP(nil, wire, source, existing)
 }
-func (s *Server) decodeUDP(wire []byte, source netip.AddrPort, existing func(uint64) *Packet) (*Packet, error) {
+
+// DecodeEstablishedUDPTo is the pooled-buffer variant of DecodeEstablishedUDP.
+func (s *Server) DecodeEstablishedUDPTo(dst, wire []byte, source netip.AddrPort, existing func(uint64) *Packet) (*Packet, error) {
+	if !s.m.v2022 || existing == nil {
+		return nil, ErrSessionExpired
+	}
+	return s.decodeUDP(dst, wire, source, existing)
+}
+func (s *Server) decodeUDP(dst, wire []byte, source netip.AddrPort, existing func(uint64) *Packet) (*Packet, error) {
 	if len(wire) > MaxUDPPacketSize || !source.IsValid() {
 		return nil, ErrFormat
 	}
 	if !s.m.v2022 {
-		return s.decode2017(wire, source)
+		return s.decode2017(dst, wire, source)
 	}
 	var plain []byte
 	var err error
@@ -65,7 +81,7 @@ func (s *Server) decodeUDP(wire []byte, source netip.AddrPort, existing func(uin
 			return nil, ErrFormat
 		}
 		var e error
-		plain, e = s.udpX.Open(nil, wire[:24], wire[24:], nil)
+		plain, e = s.udpX.Open(dst[:0], wire[:24], wire[24:], nil)
 		if e != nil {
 			return nil, ErrAuth
 		}
@@ -96,7 +112,7 @@ func (s *Server) decodeUDP(wire []byte, source netip.AddrPort, existing func(uin
 		}
 		requestAEAD = a
 		var e error
-		plain, e = a.Open(nil, header[4:16], wire[16:], nil)
+		plain, e = a.Open(dst[:0], header[4:16], wire[16:], nil)
 		if e != nil {
 			return nil, ErrAuth
 		}
@@ -188,7 +204,7 @@ func (s *Server) decodeUDP(wire []byte, source netip.AddrPort, existing func(uin
 	return &Packet{Target: target, Payload: payload, UserID: s.user, ClientSessionID: clientID, PacketID: packetID, owner: s, session: session, source: source, receivedAt: now}, nil
 }
 
-func (s *Server) decode2017(wire []byte, source netip.AddrPort) (*Packet, error) {
+func (s *Server) decode2017(dst, wire []byte, source netip.AddrPort) (*Packet, error) {
 	size := s.m.keySize
 	if len(wire) < size+16+5 {
 		return nil, ErrFormat
@@ -198,7 +214,7 @@ func (s *Server) decode2017(wire []byte, source netip.AddrPort) (*Packet, error)
 	if err != nil {
 		return nil, err
 	}
-	plain, err := a.Open(nil, make([]byte, 12), wire[size:], nil)
+	plain, err := a.Open(dst[:0], zeroNonce12[:], wire[size:], nil)
 	if err != nil {
 		return nil, ErrAuth
 	}
@@ -223,13 +239,31 @@ func (s *Server) decode2017(wire []byte, source netip.AddrPort) (*Packet, error)
 // source-address argument capable of bypassing authenticated migration state.
 // Expired sessions/capacity/packet-counter exhaustion fail closed.
 func (s *Server) EncodeUDP(request *Packet, from Address, payload []byte) (wire []byte, peer netip.AddrPort, err error) {
+	return s.encodeUDP(nil, request, from, payload)
+}
+
+// EncodeUDPTo encodes into caller-provided dst (when capacity is sufficient)
+// so hot relays can reuse wire buffers without changing EncodeUDP semantics.
+func (s *Server) EncodeUDPTo(dst []byte, request *Packet, from Address, payload []byte) (wire []byte, peer netip.AddrPort, err error) {
+	return s.encodeUDP(dst, request, from, payload)
+}
+
+func allocWire(dst []byte, n int) []byte {
+	if cap(dst) >= n {
+		return dst[:n]
+	}
+	return make([]byte, n)
+}
+
+func (s *Server) encodeUDP(dst []byte, request *Packet, from Address, payload []byte) (wire []byte, peer netip.AddrPort, err error) {
 	if request == nil || request.owner != s {
 		return nil, peer, ErrSessionExpired
 	}
 	if len(payload) > MaxUDPPacketSize {
 		return nil, peer, ErrFormat
 	}
-	address, err := from.MarshalBinary()
+	var addrBuf [259]byte
+	address, err := from.appendBinary(addrBuf[:0])
 	if err != nil {
 		return nil, peer, err
 	}
@@ -248,12 +282,11 @@ func (s *Server) EncodeUDP(request *Packet, from Address, payload []byte) (wire 
 		// One exact owned wire, rather than body + Seal output + append copy.
 		// AEAD supports the exact in-place plaintext/ciphertext overlap here.
 		start := len(salt)
-		wire = make([]byte, start+len(address)+len(payload)+a.Overhead())
+		wire = allocWire(dst, start+len(address)+len(payload)+a.Overhead())
 		copy(wire, salt)
 		copy(wire[start:], address)
 		copy(wire[start+len(address):], payload)
-		var nonce [12]byte
-		wire = a.Seal(wire[:start], nonce[:], wire[start:len(wire)-a.Overhead()], nil)
+		wire = a.Seal(wire[:start], zeroNonce12[:], wire[start:len(wire)-a.Overhead()], nil)
 		return wire, request.source, nil
 	}
 	overhead := 16 + 16 + 19
@@ -315,14 +348,14 @@ func (s *Server) EncodeUDP(request *Packet, from Address, payload []byte) (wire 
 		copy(b[19+len(address):], payload)
 	}
 	if s.m.chacha {
-		wire = make([]byte, 24+16+bodyLen+s.udpX.Overhead())
+		wire = allocWire(dst, 24+16+bodyLen+s.udpX.Overhead())
 		copy(wire, nonce)
 		plain := wire[24 : 24+16+bodyLen]
 		copy(plain, header[:])
 		fill(plain[16:])
 		return s.udpX.Seal(wire[:24], nonce, plain, nil), peer, nil
 	}
-	wire = make([]byte, 16+bodyLen+responseAEAD.Overhead())
+	wire = allocWire(dst, 16+bodyLen+responseAEAD.Overhead())
 	s.udpHeader.Encrypt(wire[:16], header[:])
 	body := wire[16 : 16+bodyLen]
 	fill(body)

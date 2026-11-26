@@ -12,7 +12,8 @@ import (
 type request struct {
 	Context   context.Context
 	UDPRead   func() (packet, error)
-	UDPWrite  func(Address, []byte) error
+	UDPWrite      func(Address, []byte) error
+	UDPWriteBatch func([]Address, [][]byte) error
 	Reply     func(net.Conn, net.Addr, bool) error
 	Command   byte
 	Target    Address

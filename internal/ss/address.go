@@ -18,11 +18,10 @@ type Address struct {
 }
 
 func (a Address) String() string { return net.JoinHostPort(a.Host, strconv.Itoa(int(a.Port))) }
-func (a Address) MarshalBinary() ([]byte, error) {
+func (a Address) appendBinary(b []byte) ([]byte, error) {
 	if a.Host == "" || strings.ContainsRune(a.Host, 0) {
 		return nil, ErrFormat
 	}
-	var b []byte
 	if ip, err := netip.ParseAddr(a.Host); err == nil {
 		if ip.Zone() != "" {
 			return nil, ErrFormat
@@ -30,18 +29,24 @@ func (a Address) MarshalBinary() ([]byte, error) {
 		ip = ip.Unmap()
 		if ip.Is4() {
 			v := ip.As4()
-			b = append([]byte{1}, v[:]...)
+			b = append(b, 1, v[0], v[1], v[2], v[3])
 		} else {
 			v := ip.As16()
-			b = append([]byte{4}, v[:]...)
+			b = append(b, 4)
+			b = append(b, v[:]...)
 		}
 	} else {
 		if len(a.Host) > 255 {
 			return nil, ErrFormat
 		}
-		b = append([]byte{3, byte(len(a.Host))}, a.Host...)
+		b = append(b, 3, byte(len(a.Host)))
+		b = append(b, a.Host...)
 	}
 	return binary.BigEndian.AppendUint16(b, a.Port), nil
+}
+
+func (a Address) MarshalBinary() ([]byte, error) {
+	return a.appendBinary(nil)
 }
 
 // ParseAddress parses just one leading address, returning the consumed bytes.

@@ -1,22 +1,11 @@
-# Kat-Server v0.8.2
+# Kat-Server v0.8.3
 
-Linux 服务端安全、稳定性与协议细节全面加固版。
+Linux 服务端极限性能优化正式发布版（配套 Kat-Client v0.2.34 / Windows Core v0.8.21 与 Kat-Manager v0.1.3）。
 
 ## 本版更新
-- **Shadowsocks 安全与内存优化**：
-  - SS2017 盐表过期优先复用物理槽与空桶页，避免长期合法流量推动内存持续增长，同时不提前淘汰有效盐；
-  - 同方法、同密钥调参热重载保留未过期的防重放状态与 UDP 关联；
-  - SS2022 UDP 来源迁移前重检当前来源 ACL 与封禁状态；AES 双向活跃会话 ID 互斥防碰撞。
-- **Trojan fallback 凭据隔离**：
-  - 凭据匹配成功后若后续请求格式错误直接关闭连接，绝不将有效认证材料转发至普通网站后端。
-- **AnyTLS 并发与超时加固**：
-  - 拆分独立有界认证中额度，不占用正式 `MaxSessions` 槽位；同密码重载跨代共享身份计数；
-  - 已开始半帧增加物理读期限；逻辑流写期限支持动态更新/清除，未上线路帧到期仅撤回该帧。
-- **TLS / ACME / 统计与运维可靠性**：
-  - `check/start/reload/watch` 统一校验证书 `NotBefore`/`NotAfter`；
-  - ACME 按完整排序域名集合分目录并以单份 `0600 pair.pem` 原子切换证钥；
-  - Cloudflare `api_url` 要求 HTTPS 且禁止降级重定向；HTTP-01 webroot 在固定目录句柄下防符号链接校验；
-  - 损坏统计文件隔离失败时保留原件并暂停覆盖，传递目录 `Sync` 错误；UDP 多地址遇被禁候选继续尝试合法地址；认证失败表满时分批清理；清理 README 过期描述。
-
-## 验证说明
-- Go 1.26.9 `go vet ./...` 0 诊断，`go test -race -count=1 ./...` 全包通过（590 通过、0 失败、4 外部互通/辅助跳过、0 race），`CGO_ENABLED=0 GOOS=linux GOARCH=amd64` 静态构建通过。
+- **Linux UDP 全链路批处理 + GSO / GRO**（`internal/kernel/udp_mmsg_linux.go`、`ss_udp.go`、`udp.go`、`internal/anytls/uot.go`）：
+  - 基于 Go netpoller 实现零分配 Linux `recvmmsg` / `sendmmsg` 批量收发与缓冲池复用，支持同目标等长包 scatter-gather `UDP_SEGMENT` (GSO) 合并发送与 `UDP_GRO` 超级包原地零拷贝拆分；非 Linux / 32 位平台与旧内核自动无损降级。
+  - SS2022 UDP 稳态无队列直通批转发 + AnyTLS UoT 多包聚合写帧，4 核满载下全栈 SS2022 UDP 4 并发达 463 Mbps（较旧版提速 2.3×、CPU 降 60%），AnyTLS UoT 达 441 Mbps（零丢包）。
+- **Linux 直通 TCP `splice(2)` 解包修复**（`internal/kernel/relay.go`）：
+  - 修复生产默认 `tcp_idle > 0` 下 `*activityStream` 包装导致 `net.TCPConn` 断言失效退化为用户态拷贝的问题；解包并按 256 KiB 分块刷新活跃时间与流量统计，直通 SOCKS5 TCP 单流由 8.25 提升至 23.3 Gbps、8 流由 19.6 提升至 35.2 Gbps（CPU 降 83%）。
+- **AnyTLS 与 SS2022 热路径精简**（`internal/anytls/*`、`internal/ss/*`）：优化地址编解码、SS2022 下行与紧凑 salt 回收热路径，压低高并发 CPU 与内存分配。

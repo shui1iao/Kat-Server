@@ -1,6 +1,7 @@
 package anytls
 
 import (
+	"bufio"
 	"context"
 	"crypto/subtle"
 	"crypto/tls"
@@ -42,6 +43,7 @@ type outbound struct {
 type session struct {
 	server                                 *Server
 	transport                              io.ReadWriteCloser
+	br                                     *bufio.Reader
 	ctx                                    context.Context
 	cancel                                 context.CancelCauseFunc
 	mu                                     sync.Mutex
@@ -241,10 +243,17 @@ func (s *Server) Serve(ctx context.Context, transport io.ReadWriteCloser, handle
 	return err
 }
 func (s *session) readLoop(handler Handler, authTimer *time.Timer, promote func() bool) error {
+	s.br = bufio.NewReaderSize(s.transport, 32*1024)
 	var header [7]byte
 	for {
 		// Let an idle authenticated carrier wait indefinitely for the first byte.
-		n, e := io.ReadAtLeast(s.transport, header[:], 1)
+		var n int
+		var e error
+		if s.br.Buffered() >= len(header) {
+			n, e = io.ReadFull(s.br, header[:])
+		} else {
+			n, e = io.ReadAtLeast(s.br, header[:], 1)
+		}
 		if e == nil && n < len(header) {
 			e = s.frameRead(header[n:], 0)
 		}
@@ -409,12 +418,28 @@ func (s *session) frameRead(buf []byte, skip int) error {
 	if len(buf) == 0 && skip == 0 {
 		return nil
 	}
+	r := io.Reader(s.transport)
+	if s.br != nil {
+		r = s.br
+		need := len(buf)
+		if skip != 0 {
+			need = skip
+		}
+		if s.br.Buffered() >= need {
+			if skip != 0 {
+				_, e := s.br.Discard(skip)
+				return unexpected(e)
+			}
+			_, e := io.ReadFull(s.br, buf)
+			return unexpected(e)
+		}
+	}
 	limit := s.server.cfg.HandshakeTimeout
 	read := func() error {
 		if skip != 0 {
-			return discard(s.transport, skip)
+			return discard(r, skip)
 		}
-		_, e := io.ReadFull(s.transport, buf)
+		_, e := io.ReadFull(r, buf)
 		return unexpected(e)
 	}
 	if d, ok := s.transport.(interface{ SetReadDeadline(time.Time) error }); ok {

@@ -265,7 +265,7 @@ func (c *Config) Validate() error {
 	def(&l.Handshakes, defaultHandshakes)
 	def(&l.Dials, defaultDials)
 	def(&l.UDPAssociations, defaultUDPAssociations)
-	def(&l.UDPQueue, 16)
+	def(&l.UDPQueue, 128)
 	def(&l.UDPQueueBytes, l.UDPQueue*maxDatagram)
 	def(&l.UDPTargets, defaultUDPTargets)
 	def(&l.BufferSize, 16384)

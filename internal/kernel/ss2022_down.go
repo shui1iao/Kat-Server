@@ -1,7 +1,6 @@
 package kernel
 
 import (
-	"github.com/shui1iao/Kat/internal/ss"
 	"io"
 	"net"
 	"syscall"
@@ -40,13 +39,16 @@ func ss2022DownSource(src net.Conn) (*ss2022DownConn, bool) {
 // and written as one record, then cleared and returned. When all leases are
 // in use the copy falls back to the ordinary relay buffer, so the extra memory
 // is at most ss2022DownLeases*ss2022DownLeaseBytes regardless of connection count.
-const ss2022DownBytes = ss.MaxChunk2022
+// Align outbound SS2022 download chunks to 32 KiB wire records (32734B payload +
+// 18B encrypted length header + 16B payload tag = 32768B) so sing-shadowsocks
+// clients (mihomo/sing-box) decode each record in one 32 KiB buffer without
+// overflow reallocation, while preserving full 65535B SIP022 receive support.
+const ss2022DownBytes = 32734
 
 // Include both AEAD tags and length in each lease, while retaining LESS
-// than the original16*65535 total allocation bound. One fewer lease means a
-// saturated relay falls back sooner; there is still no waiting or per-conn cache.
+// than the original 16*65535 total allocation bound (30*32768 = 983040 <= 1048560).
 const ss2022DownLeaseBytes = ss2022DownBytes + 34
-const ss2022DownLeases = 15
+const ss2022DownLeases = 30
 
 var ss2022DownSlots = make(chan struct{}, ss2022DownLeases)
 var ss2022DownFree = make(chan []byte, ss2022DownLeases)

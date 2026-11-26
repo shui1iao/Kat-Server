@@ -48,16 +48,28 @@ func (s *Server) copyM(dst, src net.Conn, m meter) error {
 		return s.copySS2022DownM(dst, src, t, m)
 	}
 	if !s.cfg.Limits.DisableFastPath {
-		if d, ok := dst.(*net.TCPConn); ok {
-			if r, ok := src.(*net.TCPConn); ok {
-				if m.f == nil {
+		rawDst, dstAct := unwrapActivity(dst)
+		rawSrc, srcAct := unwrapActivity(src)
+		if d, ok := rawDst.(*net.TCPConn); ok {
+			if r, ok := rawSrc.(*net.TCPConn); ok {
+				act := dstAct
+				if act == nil {
+					act = srcAct
+				}
+				if m.f == nil && act == nil {
 					_, e := d.ReadFrom(r)
 					return e
 				}
 				for {
-					// LimitedReader over a TCPConn keeps the splice path.
+					// LimitedReader over a TCPConn preserves Linux kernel splice(2)
+					// while advancing flow statistics and idle activity timestamps.
 					n, e := d.ReadFrom(&io.LimitedReader{R: r, N: spliceChunk})
-					m.add(int(n))
+					if n > 0 {
+						m.add(int(n))
+						if act != nil {
+							act.Store(time.Now().UnixNano())
+						}
+					}
 					if e != nil || n < spliceChunk {
 						return e
 					}
@@ -75,6 +87,13 @@ func closeWrite(c net.Conn) error {
 		return v.CloseWrite()
 	}
 	return c.Close()
+}
+
+func unwrapActivity(c net.Conn) (net.Conn, *atomic.Int64) {
+	if a, ok := c.(*activityStream); ok {
+		return a.Conn, a.last
+	}
+	return c, nil
 }
 
 type activityStream struct {
