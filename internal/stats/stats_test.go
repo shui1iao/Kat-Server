@@ -4,8 +4,10 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 func TestSaveLoadByName(t *testing.T) {
@@ -102,4 +104,32 @@ func TestLock(t *testing.T) {
 		t.Fatal(e)
 	}
 	release2()
+}
+
+func TestCounterCacheLineIsolation(t *testing.T) {
+	var c Counter
+	diff := uintptr(unsafe.Pointer(&c.down)) - uintptr(unsafe.Pointer(&c.up))
+	if diff < 64 {
+		t.Fatalf("Counter.up and Counter.down share a 64B cache line: offset=%d", diff)
+	}
+	if sz := unsafe.Sizeof(c); sz < 128 {
+		t.Fatalf("Counter size=%d, want >= 128 to isolate trailing struct fields", sz)
+	}
+}
+
+func BenchmarkCounterParallelUpDown(b *testing.B) {
+	var c Counter
+	var idx atomic.Uint64
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		up := idx.Add(1)%2 == 0
+		for pb.Next() {
+			if up {
+				c.AddUp(1400)
+			} else {
+				c.AddDown(1400)
+			}
+		}
+	})
 }

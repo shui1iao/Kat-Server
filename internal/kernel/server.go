@@ -34,6 +34,7 @@ type core struct {
 	wg                                        sync.WaitGroup
 	accepts                                   sync.WaitGroup
 	connSlots, handSlots, dialSlots, udpSlots *slots
+	fallbackSlots                             *slots
 	counters                                  Counters
 
 	// 0.7.0 runtime: log sink, statistics, connection registry, management API.
@@ -125,7 +126,7 @@ func (s *Server) Stats() Snapshot {
 func newCore(c *Config) (*core, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	l := c.Limits
-	k := &core{ctx: ctx, cancel: cancel, active: map[net.Conn]*acceptedState{}, connSlots: newSlots(l.Connections), handSlots: newSlots(l.Handshakes), dialSlots: newSlots(l.Dials), udpSlots: newSlots(l.UDPAssociations), logicalSlots: newSlots(l.LogicalStreams)}
+	k := &core{ctx: ctx, cancel: cancel, active: map[net.Conn]*acceptedState{}, connSlots: newSlots(l.Connections), fallbackSlots: newSlots(fallbackSlotLimit(l.Connections)), handSlots: newSlots(l.Handshakes), dialSlots: newSlots(l.Dials), udpSlots: newSlots(l.UDPAssociations), logicalSlots: newSlots(l.LogicalStreams)}
 	lg, logErr := newLogger(c.Log)
 	if logErr != nil {
 		cancel()

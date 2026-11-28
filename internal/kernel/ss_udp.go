@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"github.com/shui1iao/Kat/internal/ss"
+	"github.com/shui1iao/Kat/internal/udpmmsg"
 	"net"
 	"net/netip"
 	"runtime"
@@ -47,6 +48,7 @@ type ssUDPListener struct {
 	rcvbufInitial              int64
 	rcvbufCharge               atomic.Int64
 	lastWriteDL                atomic.Int64
+	gsoDisabled                atomic.Bool
 }
 
 // releaseRcvBuf returns this listener's charge once; concurrent/duplicate calls are no-ops.
@@ -88,7 +90,8 @@ func (s *Server) listenSSUDP(in Inbound, bound net.Addr) (*ssUDPListener, error)
 		return nil, e
 	}
 	raw, _ := u.SyscallConn()
-	l := &ssUDPListener{socket: u, raw: raw, v6Socket: isIPv6UDPSocket(u)}
+	udpmmsg.EnableGRO(raw)
+	l := &ssUDPListener{socket: u, raw: raw, v6Socket: udpmmsg.IsIPv6Socket(u)}
 	l.bind.Store(&udpBinding{g: s, idx: in.logIndex, runtime: in.ssRuntime})
 	if in.SS != nil && in.SS.UDPRcvBuf2017 != 0 {
 		if in.ssRuntime.v2022 {
@@ -130,14 +133,13 @@ func (k *core) loopSSUDP(l *ssUDPListener) {
 	k.readSSUDP(l)
 }
 func (k *core) readSSUDP(l *ssUDPListener) {
-	rb := acquireUDPRecvBatch()
-	defer releaseUDPRecvBatch(rb)
+	rb := udpmmsg.AcquireRecvBatch()
+	defer udpmmsg.ReleaseRecvBatch(rb)
 	var (
-		sb         udpSendBatch
 		fastAssoc  *ssNativeAssociation
-		fastTgts   [udpMmsgBatchSize]Address
-		fastPays   [udpMmsgBatchSize][]byte
-		fastPooled [udpMmsgBatchSize][]byte
+		fastTgts   [udpmmsg.BatchSize]Address
+		fastPays   [udpmmsg.BatchSize][]byte
+		fastPooled [udpmmsg.BatchSize][]byte
 		fastNow    time.Time
 		fastN      int
 	)
@@ -145,7 +147,7 @@ func (k *core) readSSUDP(l *ssUDPListener) {
 		if fastN == 0 {
 			return
 		}
-		if fastAssoc.a.tryDirectForwardBatch(fastTgts[:fastN], fastPays[:fastN], fastNow, &sb) {
+		if fastAssoc.a.tryDirectForwardBatch(fastTgts[:fastN], fastPays[:fastN], fastNow) {
 			for i := 0; i < fastN; i++ {
 				putUDPPlainBuf(fastPooled[i])
 				fastPooled[i] = nil
@@ -162,7 +164,7 @@ func (k *core) readSSUDP(l *ssUDPListener) {
 		fastN = 0
 	}
 	for {
-		cnt, e := readUDPBatch(l.socket, l.raw, rb)
+		cnt, e := udpmmsg.ReadBatch(l.socket, l.raw, rb)
 		b := l.bind.Load()
 		s := b.g
 		logIndex := b.idx
@@ -173,160 +175,160 @@ func (k *core) readSSUDP(l *ssUDPListener) {
 			return
 		}
 		for idx := 0; idx < cnt; idx++ {
-			wire := rb.bufs[idx]
-			n := rb.lens[idx]
-			source := rb.addrs[idx]
+			wire := rb.Bufs[idx]
+			n := rb.Lens[idx]
+			source := rb.Addrs[idx]
 			if !source.IsValid() {
 				continue
 			}
-		if n > maxDatagram || !s.handSlots.try() {
-			s.counters.Dropped.Add(1)
-			if n > maxDatagram {
-				s.failure(failUDPInvalid, "shadowsocks", logIndex)
+			if n > maxDatagram || !s.handSlots.try() {
+				s.counters.Dropped.Add(1)
+				if n > maxDatagram {
+					s.failure(failUDPInvalid, "shadowsocks", logIndex)
+				} else {
+					s.failure(failUDPBudget, "shadowsocks", logIndex)
+				}
+				continue
+			}
+			rt := b.runtime
+			var decBuf []byte
+			if n <= udpSmallBufCap {
+				decBuf = getUDPPlainBuf()
+			}
+			var p *ss.Packet
+			if rt.v2022 {
+				var refused bool
+				p, e, refused = k.decodeSS2022OnBinding(l, b, decBuf, wire[:n], source)
+				if refused {
+					putUDPPlainBuf(decBuf)
+					s.handSlots.release()
+					s.counters.Dropped.Add(1)
+					continue
+				}
 			} else {
-				s.failure(failUDPBudget, "shadowsocks", logIndex)
+				p, e = rt.codec.DecodeUDPTo(decBuf, wire[:n], source)
 			}
-			continue
-		}
-		rt := b.runtime
-		var decBuf []byte
-		if n <= udpSmallBufCap {
-			decBuf = getUDPPlainBuf()
-		}
-		var p *ss.Packet
-		if rt.v2022 {
-			var refused bool
-			p, e, refused = k.decodeSS2022OnBinding(l, b, decBuf, wire[:n], source)
-			if refused {
+			s.handSlots.release()
+			if e != nil {
 				putUDPPlainBuf(decBuf)
-				s.handSlots.release()
 				s.counters.Dropped.Add(1)
+				s.failure(failUDPInvalid, "shadowsocks", logIndex)
 				continue
 			}
-		} else {
-			p, e = rt.codec.DecodeUDPTo(decBuf, wire[:n], source)
-		}
-		s.handSlots.release()
-		if e != nil {
-			putUDPPlainBuf(decBuf)
-			s.counters.Dropped.Add(1)
-			s.failure(failUDPInvalid, "shadowsocks", logIndex)
-			continue
-		}
-		payload := p.Payload
-		// Detach payload slice from capability so capability never aliases pooled memory.
-		p.Payload = nil
-		var pooled []byte
-		if decBuf != nil && cap(payload) <= cap(decBuf) {
-			pooled = decBuf
-		} else if decBuf != nil {
-			putUDPPlainBuf(decBuf)
-		}
-		id := ssAssociationID{source: source}
-		if rt.v2022 {
-			id = ssAssociationID{session: p.ClientSessionID}
-		}
-		now := p.AuthenticatedAt()
-		// Steady-state fast path under RLock: avoids exclusive lock contention
-		// between parallel SS UDP readers and outbound replies.
-		rt.mu.RLock()
-		if s.nativeContext.Err() == nil {
-			if assoc := rt.associations[id]; assoc != nil && assoc.a.ctx.Err() == nil && !assoc.a.ssIdleExpired(now) {
-				if st := assoc.replyState.Load(); st == nil || st.listener != l {
-					assoc.replyState.Store(&ssReplyState{capability: p, listener: l})
-				}
-				assoc.a.touchSSActivity(now)
-				rt.mu.RUnlock()
-				if fastAssoc != nil && fastAssoc != assoc {
-					flushFast()
-				}
-				fastAssoc = assoc
-				fastNow = now
-				fastTgts[fastN] = Address{p.Target.Host, p.Target.Port}
-				fastPays[fastN] = payload
-				fastPooled[fastN] = pooled
-				fastN++
-				continue
+			payload := p.Payload
+			// Detach payload slice from capability so capability never aliases pooled memory.
+			p.Payload = nil
+			var pooled []byte
+			if decBuf != nil && cap(payload) <= cap(decBuf) {
+				pooled = decBuf
+			} else if decBuf != nil {
+				putUDPPlainBuf(decBuf)
 			}
-		}
-		rt.mu.RUnlock()
-		flushFast()
+			id := ssAssociationID{source: source}
+			if rt.v2022 {
+				id = ssAssociationID{session: p.ClientSessionID}
+			}
+			now := p.AuthenticatedAt()
+			// Steady-state fast path under RLock: avoids exclusive lock contention
+			// between parallel SS UDP readers and outbound replies.
+			rt.mu.RLock()
+			if s.nativeContext.Err() == nil {
+				if assoc := rt.associations[id]; assoc != nil && assoc.a.ctx.Err() == nil && !assoc.a.ssIdleExpired(now) {
+					if st := assoc.replyState.Load(); st == nil || st.listener != l {
+						assoc.replyState.Store(&ssReplyState{capability: p, listener: l})
+					}
+					assoc.a.touchSSActivity(now)
+					rt.mu.RUnlock()
+					if fastAssoc != nil && fastAssoc != assoc {
+						flushFast()
+					}
+					fastAssoc = assoc
+					fastNow = now
+					fastTgts[fastN] = Address{p.Target.Host, p.Target.Port}
+					fastPays[fastN] = payload
+					fastPooled[fastN] = pooled
+					fastN++
+					continue
+				}
+			}
+			rt.mu.RUnlock()
+			flushFast()
 
-		rt.mu.Lock()
-		if s.nativeContext.Err() != nil {
+			rt.mu.Lock()
+			if s.nativeContext.Err() != nil {
+				rt.mu.Unlock()
+				putUDPPlainBuf(pooled)
+				s.counters.Dropped.Add(1)
+				continue
+			}
+			assoc := rt.associations[id]
+			if assoc != nil && (assoc.a.ctx.Err() != nil || assoc.a.ssIdleExpired(now)) {
+				assoc.a.cancel()
+				delete(rt.associations, id)
+				assoc = nil
+			}
+			if assoc == nil {
+				// A new association belongs to the generation bound right now; a
+				// removed (draining) socket accepts no new association.
+				if !rt.v2022 && s.udpSourceRefused(source.Addr(), logIndex) {
+					rt.mu.Unlock()
+					putUDPPlainBuf(pooled)
+					s.counters.Dropped.Add(1)
+					continue
+				}
+				k.bindMu.RLock()
+				ok := !l.draining.Load() && l.bind.Load() == b
+				if ok {
+					s.refs.Add(1)
+				}
+				k.bindMu.RUnlock()
+				if !ok {
+					rt.mu.Unlock()
+					putUDPPlainBuf(pooled)
+					s.counters.Dropped.Add(1)
+					continue
+				}
+				if !s.udpSlots.try() {
+					rt.mu.Unlock()
+					putUDPPlainBuf(pooled)
+					s.counters.Dropped.Add(1)
+					s.failure(failUDPBudget, "shadowsocks", logIndex)
+					s.unref()
+					continue
+				}
+				base := withInbound(withSourceIP(s.nativeContext, source.Addr()), logIndex)
+				base = withInboundMeta(base, &s.cfg.Inbounds[logIndex], l.socket.LocalAddr(), net.UDPAddrFromAddrPort(source))
+				f, fctx := s.newFlow(base, "udp", Address{})
+				ctx, cancel := context.WithCancel(fctx)
+				a := &udpAssociation{server: s, ctx: ctx, cancel: cancel, ssNative: true, queue: make(chan packet, s.cfg.Limits.UDPQueue), allowed: map[netip.AddrPort]time.Time{}, source: source.Addr(), flow: f}
+				if e = a.openOutbound(); e != nil {
+					cancel()
+					f.end("udp_socket_failed")
+					s.udpSlots.release()
+					rt.mu.Unlock()
+					putUDPPlainBuf(pooled)
+					s.counters.Dropped.Add(1)
+					s.failure(failUDPIO, "shadowsocks", logIndex)
+					s.unref()
+					continue
+				}
+				a.activity.Store(now.UnixNano())
+				assoc = &ssNativeAssociation{a: a, runtime: rt, id: id, origin: l}
+				l.assocs.Add(1)
+				a.writeBack = assoc.reply
+				a.writeBackBatch = assoc.replyBatch
+				rt.associations[id] = assoc
+				s.counters.UDP.Add(1)
+				s.wg.Add(1)
+				go s.runSSAssociation(assoc)
+			}
+			assoc.capability = p
+			assoc.listener = l
+			assoc.replyState.Store(&ssReplyState{capability: p, listener: l})
+			// Only a fully authenticated, fresh, formatted request reaches here.
+			assoc.a.touchSSActivity(now)
+			assoc.a.enqueue(packet{target: Address{p.Target.Host, p.Target.Port}, payload: payload, pooled: pooled})
 			rt.mu.Unlock()
-			putUDPPlainBuf(pooled)
-			s.counters.Dropped.Add(1)
-			continue
-		}
-		assoc := rt.associations[id]
-		if assoc != nil && (assoc.a.ctx.Err() != nil || assoc.a.ssIdleExpired(now)) {
-			assoc.a.cancel()
-			delete(rt.associations, id)
-			assoc = nil
-		}
-		if assoc == nil {
-			// A new association belongs to the generation bound right now; a
-			// removed (draining) socket accepts no new association.
-			if !rt.v2022 && s.udpSourceRefused(source.Addr(), logIndex) {
-				rt.mu.Unlock()
-				putUDPPlainBuf(pooled)
-				s.counters.Dropped.Add(1)
-				continue
-			}
-			k.bindMu.RLock()
-			ok := !l.draining.Load() && l.bind.Load() == b
-			if ok {
-				s.refs.Add(1)
-			}
-			k.bindMu.RUnlock()
-			if !ok {
-				rt.mu.Unlock()
-				putUDPPlainBuf(pooled)
-				s.counters.Dropped.Add(1)
-				continue
-			}
-			if !s.udpSlots.try() {
-				rt.mu.Unlock()
-				putUDPPlainBuf(pooled)
-				s.counters.Dropped.Add(1)
-				s.failure(failUDPBudget, "shadowsocks", logIndex)
-				s.unref()
-				continue
-			}
-			base := withInbound(withSourceIP(s.nativeContext, source.Addr()), logIndex)
-			base = withInboundMeta(base, &s.cfg.Inbounds[logIndex], l.socket.LocalAddr(), net.UDPAddrFromAddrPort(source))
-			f, fctx := s.newFlow(base, "udp", Address{})
-			ctx, cancel := context.WithCancel(fctx)
-			a := &udpAssociation{server: s, ctx: ctx, cancel: cancel, ssNative: true, queue: make(chan packet, s.cfg.Limits.UDPQueue), allowed: map[netip.AddrPort]time.Time{}, source: source.Addr(), flow: f}
-			if e = a.openOutbound(); e != nil {
-				cancel()
-				f.end("udp_socket_failed")
-				s.udpSlots.release()
-				rt.mu.Unlock()
-				putUDPPlainBuf(pooled)
-				s.counters.Dropped.Add(1)
-				s.failure(failUDPIO, "shadowsocks", logIndex)
-				s.unref()
-				continue
-			}
-			a.activity.Store(now.UnixNano())
-			assoc = &ssNativeAssociation{a: a, runtime: rt, id: id, origin: l}
-			l.assocs.Add(1)
-			a.writeBack = assoc.reply
-			a.writeBackBatch = assoc.replyBatch
-			rt.associations[id] = assoc
-			s.counters.UDP.Add(1)
-			s.wg.Add(1)
-			go s.runSSAssociation(assoc)
-		}
-		assoc.capability = p
-		assoc.listener = l
-		assoc.replyState.Store(&ssReplyState{capability: p, listener: l})
-		// Only a fully authenticated, fresh, formatted request reaches here.
-		assoc.a.touchSSActivity(now)
-		assoc.a.enqueue(packet{target: Address{p.Target.Host, p.Target.Port}, payload: payload, pooled: pooled})
-		rt.mu.Unlock()
 		}
 		flushFast()
 	}
@@ -381,8 +383,10 @@ func (a *udpAssociation) openOutbound() error {
 		return e
 	}
 	a.raw4, _ = a.outbound4.SyscallConn()
+	udpmmsg.EnableGRO(a.raw4)
 	if a.outbound6 != nil {
 		a.raw6, _ = a.outbound6.SyscallConn()
+		udpmmsg.EnableGRO(a.raw6)
 	}
 	a.activity.Store(time.Now().UnixNano())
 	return nil
@@ -520,14 +524,17 @@ func (n *ssNativeAssociation) replyBatch(froms []Address, payloads [][]byte) err
 		return errors.New("missing authenticated SS listener")
 	}
 	var (
-		encBufs  [udpMmsgBatchSize][]byte
-		wires    [udpMmsgBatchSize][]byte
-		peers    [udpMmsgBatchSize]netip.AddrPort
-		sb       udpSendBatch
+		encBufs  [udpmmsg.BatchSize][]byte
+		wires    [udpmmsg.BatchSize][]byte
+		peers    [udpmmsg.BatchSize]netip.AddrPort
+		sb       udpmmsg.SendBatch
 		numWires int
 	)
+	if l.gsoDisabled.Load() {
+		sb.DisableGSO()
+	}
 	defer func() {
-		for i := 0; i < len(payloads) && i < udpMmsgBatchSize; i++ {
+		for i := 0; i < len(payloads) && i < udpmmsg.BatchSize; i++ {
 			if encBufs[i] != nil {
 				putUDPPlainBuf(encBufs[i])
 			}
@@ -536,7 +543,7 @@ func (n *ssNativeAssociation) replyBatch(froms []Address, payloads [][]byte) err
 	for i := 0; i < len(payloads); i++ {
 		payload := payloads[i]
 		var encBuf []byte
-		if len(payload)+320 <= udpSmallBufCap && i < udpMmsgBatchSize {
+		if len(payload)+320 <= udpSmallBufCap && i < udpmmsg.BatchSize {
 			encBuf = getUDPPlainBuf()
 			encBufs[i] = encBuf
 		}
@@ -566,20 +573,23 @@ func (n *ssNativeAssociation) replyBatch(froms []Address, payloads [][]byte) err
 			l.socket.SetWriteDeadline(now.Add(dialTimeout))
 		}
 	}
-	_, e := writeUDPBatch(l.socket, l.raw, l.v6Socket, &sb, wires[:numWires], peers[:numWires])
+	_, e := udpmmsg.WriteBatch(l.socket, l.raw, l.v6Socket, &sb, wires[:numWires], peers[:numWires])
+	if sb.GSODisabled() {
+		l.gsoDisabled.Store(true)
+	}
 	return e
 }
 
 // tryDirectForwardBatch sends a batch of already-decoded steady-state SS UDP
 // payloads directly via sendmmsg when the target IP is already authorized and
 // the association queue is empty, eliminating the a.queue channel hop.
-func (a *udpAssociation) tryDirectForwardBatch(targets []Address, payloads [][]byte, now time.Time, sb *udpSendBatch) bool {
+func (a *udpAssociation) tryDirectForwardBatch(targets []Address, payloads [][]byte, now time.Time) bool {
 	if len(payloads) == 0 || len(a.queue) > 0 || a.ctx.Err() != nil {
 		return false
 	}
 	var (
-		ips [udpMmsgBatchSize]netip.AddrPort
-		rts [udpMmsgBatchSize]*udpRoute
+		ips [udpmmsg.BatchSize]netip.AddrPort
+		rts [udpmmsg.BatchSize]*udpRoute
 		is6 bool
 	)
 	idle := a.server.cfg.Limits.UDPIdle.value()
@@ -625,14 +635,16 @@ func (a *udpAssociation) tryDirectForwardBatch(targets []Address, payloads [][]b
 	iv := deadlineRefreshInterval(dialTimeout)
 	a.outputMu.Lock()
 	dlPtr := &a.lastOutWriteDL4
+	sbPtr := &a.sb4
 	if is6 {
 		dlPtr = &a.lastOutWriteDL6
+		sbPtr = &a.sb6
 	}
 	if iv == 0 || nowNano-*dlPtr >= iv {
 		sock.SetWriteDeadline(now.Add(dialTimeout))
 		*dlPtr = nowNano
 	}
-	sent, e := writeUDPBatch(sock, raw, is6, sb, payloads, ips[:len(payloads)])
+	sent, e := udpmmsg.WriteBatch(sock, raw, is6, sbPtr, payloads, ips[:len(payloads)])
 	a.outputMu.Unlock()
 	for i := 0; i < sent; i++ {
 		if a.flow != nil {

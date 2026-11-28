@@ -237,6 +237,7 @@ func (k *core) prepareContext(ctx context.Context, c Config, prev *Server) (*Ser
 	}
 	seen := map[string]bool{}
 	ephemeral := map[string]int{}
+	boundAddrs := make([]net.Addr, len(g.cfg.Inbounds))
 	for i := range g.cfg.Inbounds {
 		if e := ctx.Err(); e != nil {
 			return fail("canceled", e)
@@ -267,6 +268,7 @@ func (k *core) prepareContext(ctx context.Context, c Config, prev *Server) (*Ser
 			p.newTCP[key] = ln
 			addr = ln.Addr()
 		}
+		boundAddrs[i] = addr
 		if in.ssRuntime != nil {
 			k.udpMu.Lock()
 			u := k.udpEntries[key]
@@ -286,6 +288,13 @@ func (k *core) prepareContext(ctx context.Context, c Config, prev *Server) (*Ser
 				p.newUDP[key] = u
 			}
 		}
+	}
+	apiListen := ""
+	if c.API != nil {
+		apiListen = c.API.Listen
+	}
+	if err := validateBoundFallbacks(g.cfg.Inbounds, boundAddrs, apiListen); err != nil {
+		return fail("inbound", err)
 	}
 	if prev != nil && logSinkChanged(prev.cfg.Log, c.Log) {
 		lg, e := newLogger(c.Log)
@@ -433,6 +442,7 @@ func (k *core) commitContext(ctx context.Context, g *Server, p *plan) error {
 func (k *core) applyRuntime(prev, g *Server, p *plan) {
 	l := g.cfg.Limits
 	k.connSlots.setLimit(l.Connections)
+	k.fallbackSlots.setLimit(fallbackSlotLimit(l.Connections))
 	k.handSlots.setLimit(l.Handshakes)
 	k.dialSlots.setLimit(l.Dials)
 	k.udpSlots.setLimit(l.UDPAssociations)

@@ -119,7 +119,7 @@ func (c *Config) validateSecurity() error {
 		if e := in.validateSOCKS5Options(c, i); e != nil {
 			return e
 		}
-		if e := in.validateFallback(i); e != nil {
+		if e := in.validateFallback(c, i); e != nil {
 			return e
 		}
 	}

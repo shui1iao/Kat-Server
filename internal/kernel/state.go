@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/shui1iao/Kat/internal/stats"
+	"github.com/shui1iao/Kat/internal/udpmmsg"
 )
 
 // ---- instance state files ----
@@ -84,6 +85,7 @@ func (k *core) startStats(c *Config) {
 		tick := time.NewTicker(time.Second)
 		defer tick.Stop()
 		last := time.Now()
+		var idleUDPTicks, idleTCPTicks int
 		k.reg.Sample(last)
 		for {
 			select {
@@ -91,6 +93,28 @@ func (k *core) startStats(c *Config) {
 				return
 			case now := <-tick.C:
 				k.reg.Sample(now)
+				if k.counters.UDP.Load() == 0 {
+					if idleUDPTicks < 30 {
+						idleUDPTicks++
+						if idleUDPTicks == 30 {
+							udpmmsg.TrimPool()
+						}
+					}
+				} else {
+					idleUDPTicks = 0
+				}
+				if k.counters.Active.Load() == 0 && k.logical.Load() == 0 {
+					if idleTCPTicks < 30 {
+						idleTCPTicks++
+						if idleTCPTicks == 30 {
+							if cur := k.gen.Load(); cur != nil {
+								cur.TrimBuffers()
+							}
+						}
+					}
+				} else {
+					idleTCPTicks = 0
+				}
 				if now.Sub(last) >= time.Duration(k.saveInterval.Load()) {
 					last = now
 					k.saveStats()

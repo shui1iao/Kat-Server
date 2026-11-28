@@ -158,6 +158,7 @@ func ValidatePaddingScheme(s string, limit int) error {
 	}
 	lines := strings.Split(s, "\n")
 	seen := make(map[string]bool)
+	seenIdx := map[int]bool{}
 	stop := -1
 	if len(lines) > 66 {
 		return ErrConfig
@@ -177,9 +178,10 @@ func ValidatePaddingScheme(s string, limit int) error {
 			continue
 		}
 		index, e := strconv.Atoi(p[0])
-		if e != nil || index < 0 || index >= 64 {
+		if e != nil || index < 0 || index >= 64 || seenIdx[index] {
 			return ErrConfig
 		}
+		seenIdx[index] = true
 		tokens := strings.Split(p[1], ",")
 		if len(tokens) > 32 || len(tokens) == 0 || (index == 0 && len(tokens) != 1) {
 			return ErrConfig
@@ -205,12 +207,9 @@ func ValidatePaddingScheme(s string, limit int) error {
 	if stop < 0 {
 		return ErrConfig
 	}
-	for k := range seen {
-		if k != "stop" {
-			v, _ := strconv.Atoi(k)
-			if v >= stop {
-				return ErrConfig
-			}
+	for idx := range seenIdx {
+		if idx >= stop {
+			return ErrConfig
 		}
 	}
 	return nil

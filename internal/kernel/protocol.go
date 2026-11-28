@@ -10,17 +10,17 @@ import (
 )
 
 type request struct {
-	Context   context.Context
-	UDPRead   func() (packet, error)
+	Context       context.Context
+	UDPRead       func() (packet, error)
 	UDPWrite      func(Address, []byte) error
 	UDPWriteBatch func([]Address, [][]byte) error
-	Reply     func(net.Conn, net.Addr, bool) error
-	Command   byte
-	Target    Address
-	Mode      string
-	UserIndex int      // -1 for intentionally unauthenticated loopback SOCKS
-	Stream    net.Conn // optional transforming stream; never expose raw TCP if transforms remain
-	Datagrams datagramCodec
+	Reply         func(net.Conn, net.Addr, bool) error
+	Command       byte
+	Target        Address
+	Mode          string
+	UserIndex     int      // -1 for intentionally unauthenticated loopback SOCKS
+	Stream        net.Conn // optional transforming stream; never expose raw TCP if transforms remain
+	Datagrams     datagramCodec
 }
 type adapter func(net.Conn, Inbound) (request, error)
 
@@ -49,15 +49,17 @@ func (r request) respond(c net.Conn, bound net.Addr, ok bool) error {
 }
 func parseSOCKS(c net.Conn, in Inbound) (request, error) {
 	r := request{Mode: "socks5", UserIndex: -1}
-	h, e := readN(c, 2)
-	if e != nil {
+	poolBuf := getUDPPlainBuf()
+	defer putUDPPlainBuf(poolBuf)
+	scratch := poolBuf[:516]
+	if e := readExact(c, scratch[:2]); e != nil {
 		return r, e
 	}
-	if h[0] != 5 || h[1] == 0 {
+	if scratch[0] != 5 || scratch[1] == 0 {
 		return r, errors.New("invalid SOCKS greeting")
 	}
-	methods, e := readN(c, int(h[1]))
-	if e != nil {
+	nMethods := int(scratch[1])
+	if e := readExact(c, scratch[:nMethods]); e != nil {
 		return r, e
 	}
 	method := byte(0)
@@ -65,7 +67,7 @@ func parseSOCKS(c net.Conn, in Inbound) (request, error) {
 		method = 2
 	}
 	found := false
-	for _, v := range methods {
+	for _, v := range scratch[:nMethods] {
 		if v == method {
 			found = true
 		}
@@ -74,34 +76,35 @@ func parseSOCKS(c net.Conn, in Inbound) (request, error) {
 		_ = writeAll(c, []byte{5, 255})
 		return r, errors.New("no supported authentication method")
 	}
-	if e = writeAll(c, []byte{5, method}); e != nil {
+	if e := writeAll(c, []byte{5, method}); e != nil {
 		return r, e
 	}
 	if method == 2 {
-		v, e := readN(c, 2)
-		if e != nil {
+		if e := readExact(c, scratch[:2]); e != nil {
 			return r, e
 		}
-		if v[0] != 1 || v[1] == 0 {
+		if scratch[0] != 1 || scratch[1] == 0 {
 			return r, errors.New("invalid authentication version or username")
 		}
-		u, e := readN(c, int(v[1]))
-		if e != nil {
+		uLen := int(scratch[1])
+		uBuf := scratch[:uLen]
+		if e := readExact(c, uBuf); e != nil {
 			return r, e
 		}
-		n, e := readN(c, 1)
-		if e != nil {
+		lenSlot := scratch[256:257]
+		if e := readExact(c, lenSlot); e != nil {
 			return r, e
 		}
-		if n[0] == 0 {
+		if lenSlot[0] == 0 {
 			return r, errors.New("empty password")
 		}
-		p, e := readN(c, int(n[0]))
-		if e != nil {
+		pLen := int(lenSlot[0])
+		pBuf := scratch[257 : 257+pLen]
+		if e := readExact(c, pBuf); e != nil {
 			return r, e
 		}
-		providedUser := sha256.Sum256(u)
-		providedPass := sha256.Sum256(p)
+		providedUser := sha256.Sum256(uBuf)
+		providedPass := sha256.Sum256(pBuf)
 		match := 0
 		for i, usr := range in.Users {
 			expectedUser := sha256.Sum256([]byte(usr.Username))
@@ -116,39 +119,44 @@ func parseSOCKS(c net.Conn, in Inbound) (request, error) {
 		if match == 0 {
 			status = 1
 		}
-		if e = writeAll(c, []byte{1, status}); e != nil {
+		if e := writeAll(c, []byte{1, status}); e != nil {
 			return r, e
 		}
 		if match == 0 {
 			return r, errSOCKSAuth
 		}
 	}
-	h, e = readN(c, 3)
-	if e != nil {
+	if e := readExact(c, scratch[:3]); e != nil {
 		return r, e
 	}
-	if h[0] != 5 || h[2] != 0 {
+	if scratch[0] != 5 || scratch[2] != 0 {
 		return r, errors.New("invalid SOCKS request")
 	}
-	r.Command = h[1]
+	r.Command = scratch[1]
 	if r.Command != 1 && r.Command != 3 && (r.Command != 2 || in.bindOptions() == nil) {
 		_ = writeAll(c, []byte{5, 7, 0, 1, 0, 0, 0, 0, 0, 0})
 		return r, errors.New("unsupported SOCKS command")
 	}
-	r.Target, e = readAddress(c, false)
+	var e error
+	r.Target, e = readAddressBuf(c, scratch[:260])
 	if e != nil {
 		_ = writeAll(c, []byte{5, 8, 0, 1, 0, 0, 0, 0, 0, 0})
 		return r, e
 	}
 	return r, nil
 }
-func expectCRLF(r io.Reader) error {
-	b, e := readN(r, 2)
-	if e != nil {
+
+func expectCRLFBuf(r io.Reader, b []byte) error {
+	if e := readExact(r, b[:2]); e != nil {
 		return e
 	}
 	if b[0] != 13 || b[1] != 10 {
 		return errors.New("invalid CRLF")
 	}
 	return nil
+}
+
+func expectCRLF(r io.Reader) error {
+	var b [2]byte
+	return expectCRLFBuf(r, b[:])
 }

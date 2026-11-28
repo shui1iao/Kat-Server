@@ -17,6 +17,8 @@ func TestCheckAnyTLSPadding(t *testing.T) {
 		{"empty-default", "", true},
 		{"custom", "stop=2\n0=30-30\n1=100-200", true},
 		{"invalid", "stop=0", false},
+		{"dup-zero", "stop=2\n0=30-30\n00=30-30", false},
+		{"dup-plus-zero", "stop=2\n0=30-30\n+0=30-30", false},
 		{"oversized", "stop=1\n0=" + strings.Repeat("0", 4086) + "-0", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

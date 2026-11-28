@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -32,6 +33,51 @@ func (p *bufferPool) put(b []byte) {
 	default:
 	}
 }
+func (p *bufferPool) bytes() uint64 {
+	if p == nil {
+		return 0
+	}
+	return uint64(len(p.free)) * uint64(p.size)
+}
+func (p *bufferPool) drain() int {
+	if p == nil {
+		return 0
+	}
+	dropped := 0
+	for {
+		select {
+		case <-p.free:
+			dropped++
+		default:
+			return dropped
+		}
+	}
+}
+
+// TrimBuffers drops idle relay buffers cached in the generation pool so long
+// idle periods return their spans to the OS.
+func (s *Server) TrimBuffers() int {
+	if s == nil {
+		return 0
+	}
+	cur := s.current()
+	if cur == nil || cur.pool == nil {
+		return 0
+	}
+	return cur.pool.drain()
+}
+
+const (
+	smallRelayBufSize      = 8 << 10
+	smallRelayDemoteThresh = 4 << 10
+)
+
+var smallRelayBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, smallRelayBufSize)
+		return &b
+	},
+}
 
 type readOnly struct{ io.Reader }
 type writeOnly struct{ io.Writer }
@@ -39,8 +85,8 @@ type writeOnly struct{ io.Writer }
 func (s *Server) copy(dst, src net.Conn) error { return s.copyM(dst, src, meter{}) }
 
 // spliceChunk bounds one kernel splice while statistics are kept, so that
-// counters and rates advance during long transfers.
-const spliceChunk = 256 << 10
+// counters and rates advance smoothly during long transfers.
+const spliceChunk = 64 << 10
 
 // copyM is copy with payload metering: m counts the bytes written to dst.
 func (s *Server) copyM(dst, src net.Conn, m meter) error {
@@ -77,10 +123,15 @@ func (s *Server) copyM(dst, src net.Conn, m meter) error {
 			}
 		}
 	}
-	b := s.pool.get()
-	defer s.pool.put(b)
-	_, e := io.CopyBuffer(writeOnly{m.writer(dst)}, readOnly{src}, b)
-	return e
+	rawSrcConn, _ := unwrapActivity(src)
+	_, ss2017Down := rawSrcConn.(*ssDownReadConn)
+	if s.pool.size <= smallRelayBufSize || ss2017Down {
+		b := s.pool.get()
+		defer s.pool.put(b)
+		_, e := io.CopyBuffer(writeOnly{m.writer(dst)}, readOnly{src}, b)
+		return e
+	}
+	return copyAdaptive(dst, src, m, s.pool)
 }
 func closeWrite(c net.Conn) error {
 	if v, ok := c.(interface{ CloseWrite() error }); ok {
@@ -127,6 +178,16 @@ func (s *Server) relayIdle(ctx context.Context, a, b net.Conn, idle time.Duratio
 		exited := make(chan struct{})
 		defer func() { close(stop); <-exited }()
 		originalA, originalB := a, b
+		var tcA, tcB *net.TCPConn
+		var progA, progB tcpProgressSample
+		if !s.cfg.Limits.DisableFastPath {
+			a1, b1 := extractTCPConn(originalA), extractTCPConn(originalB)
+			if a1 != nil && b1 != nil {
+				tcA, tcB = a1, b1
+				progA = sampleTCPProgress(tcA)
+				progB = sampleTCPProgress(tcB)
+			}
+		}
 		go func() {
 			defer close(exited)
 			timer := time.NewTimer(idle)
@@ -136,11 +197,26 @@ func (s *Server) relayIdle(ctx context.Context, a, b net.Conn, idle time.Duratio
 				case <-stop:
 					return
 				case <-timer.C:
-					remaining := idle - time.Since(time.Unix(0, last.Load()))
+					now := time.Now()
+					remaining := idle - now.Sub(time.Unix(0, last.Load()))
 					if remaining <= 0 {
+						if tcA != nil && tcB != nil {
+							curA := sampleTCPProgress(tcA)
+							curB := sampleTCPProgress(tcB)
+							if curA.advanced(progA) || curB.advanced(progB) {
+								progA, progB = curA, curB
+								last.Store(now.UnixNano())
+								timer.Reset(idle)
+								continue
+							}
+						}
 						originalA.Close()
 						originalB.Close()
 						return
+					}
+					if tcA != nil && tcB != nil {
+						progA = sampleTCPProgress(tcA)
+						progB = sampleTCPProgress(tcB)
 					}
 					timer.Reset(remaining)
 				}
@@ -192,4 +268,54 @@ func (s *Server) relayIdle(ctx context.Context, a, b net.Conn, idle time.Duratio
 		err = ctx.Err()
 	}
 	return err
+}
+
+// copyAdaptive starts with the full pool buffer (preserving single-write bulk
+// framing) and demotes idle/small-frame streams (<= 4 KiB read) to an 8 KiB
+// pooled buffer while blocked in Read, promoting immediately back to the full
+// buffer as soon as a read fills 8 KiB.
+func copyAdaptive(dst, src net.Conn, m meter, pool *bufferPool) error {
+	w := m.writer(dst)
+	large := pool.get()
+	var smallPtr *[]byte
+	cur := large
+	defer func() {
+		if large != nil {
+			pool.put(large)
+		}
+		if smallPtr != nil {
+			clear(*smallPtr)
+			smallRelayBufPool.Put(smallPtr)
+		}
+	}()
+	for {
+		nr, er := src.Read(cur)
+		if nr > 0 {
+			nw, ew := w.Write(cur[:nr])
+			if ew != nil {
+				return ew
+			}
+			if nr != nw {
+				return io.ErrShortWrite
+			}
+		}
+		if er != nil {
+			if er == io.EOF {
+				return nil
+			}
+			return er
+		}
+		if large != nil && nr <= smallRelayDemoteThresh {
+			pool.put(large)
+			large = nil
+			smallPtr = smallRelayBufPool.Get().(*[]byte)
+			cur = *smallPtr
+		} else if large == nil && nr == len(cur) {
+			clear(*smallPtr)
+			smallRelayBufPool.Put(smallPtr)
+			smallPtr = nil
+			large = pool.get()
+			cur = large
+		}
+	}
 }

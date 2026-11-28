@@ -458,3 +458,22 @@ func TestStandaloneFixtureAuthenticationBytes(t *testing.T) {
 		}
 	}
 }
+
+func TestValidatePaddingSchemeDuplicateIndex(t *testing.T) {
+	for _, bad := range []string{
+		"stop=2\n0=30-30\n00=30-30",
+		"stop=2\n0=30-30\n+0=30-30",
+		"stop=3\n0=30-30\n1=10-20\n01=20-30",
+		"stop=2\nstop=2\n0=30-30",
+	} {
+		if err := ValidatePaddingScheme(bad, 4096); !errors.Is(err, ErrConfig) {
+			t.Fatalf("ValidatePaddingScheme(%q) = %v, want ErrConfig", bad, err)
+		}
+		if _, err := NewServer(Config{Password: "x", PaddingScheme: bad}); !errors.Is(err, ErrConfig) {
+			t.Fatalf("NewServer(%q) = %v, want ErrConfig", bad, err)
+		}
+	}
+	if err := ValidatePaddingScheme("stop=2\n0=30-30\n1=100-200", 4096); err != nil {
+		t.Fatalf("valid padding scheme rejected: %v", err)
+	}
+}

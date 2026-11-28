@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/shui1iao/Kat/internal/udpmmsg"
 )
 
 const maxDatagram = 65507
@@ -18,20 +20,19 @@ const udpSmallBufCap = 2048
 
 var udpBufPool = sync.Pool{
 	New: func() any {
-		b := make([]byte, udpSmallBufCap)
-		return &b
+		return new([udpSmallBufCap]byte)
 	},
 }
 
 func getUDPPlainBuf() []byte {
-	return (*udpBufPool.Get().(*[]byte))[:0]
+	return udpBufPool.Get().(*[udpSmallBufCap]byte)[:0]
 }
 
 func putUDPPlainBuf(b []byte) {
 	if cap(b) == udpSmallBufCap {
-		s := b[:udpSmallBufCap]
-		clear(s)
-		udpBufPool.Put(&s)
+		arr := (*[udpSmallBufCap]byte)(b[:udpSmallBufCap])
+		clear(arr[:])
+		udpBufPool.Put(arr)
 	}
 }
 
@@ -57,6 +58,7 @@ func releasePacket(p packet) {
 		putUDPPlainBuf(p.pooled)
 	}
 }
+
 type udpAssociation struct {
 	server                       *Server
 	writeBack                    func(Address, []byte) error
@@ -84,10 +86,11 @@ type udpAssociation struct {
 	routes map[netip.AddrPort]*udpRoute
 
 	// Hot-path throttling state (single-writer per loop or guarded by outputMu/mu).
-	lastAllowedSweep     int64
-	lastOutWriteDL4      int64
-	lastOutWriteDL6      int64
-	lastOutputWriteDL    int64
+	lastAllowedSweep   int64
+	lastOutWriteDL4    int64
+	lastOutWriteDL6    int64
+	lastOutputWriteDL  int64
+	sb4, sb6, sbNative udpmmsg.SendBatch
 }
 
 func (s *Server) resolve(ctx context.Context, a Address) (netip.AddrPort, error) {
@@ -141,6 +144,7 @@ func (s *Server) serveUDP(c net.Conn, r request) error {
 		return e
 	}
 	a.raw4, _ = a.outbound4.SyscallConn()
+	udpmmsg.EnableGRO(a.raw4)
 	defer a.outbound4.Close()
 	a.outbound6, e = net.ListenUDP("udp6", &net.UDPAddr{IP: net.ParseIP(s.cfg.UDPBindIPv6)})
 	if e != nil && s.cfg.UDPBindIPv6 != "" {
@@ -148,6 +152,7 @@ func (s *Server) serveUDP(c net.Conn, r request) error {
 	}
 	if a.outbound6 != nil {
 		a.raw6, _ = a.outbound6.SyscallConn()
+		udpmmsg.EnableGRO(a.raw6)
 		defer a.outbound6.Close()
 	}
 	if r.Mode == "socks5" {
@@ -172,7 +177,7 @@ func (s *Server) serveUDP(c net.Conn, r request) error {
 			return e
 		}
 		a.rawNative, _ = a.native.SyscallConn()
-		a.v6Native = isIPv6UDPSocket(a.native)
+		a.v6Native = udpmmsg.IsIPv6Socket(a.native)
 		defer a.native.Close()
 	}
 	var bound net.Addr
@@ -339,8 +344,7 @@ func (a *udpAssociation) streamLoop() error {
 }
 func (a *udpAssociation) sendLoop() {
 	idle := a.server.cfg.Limits.UDPIdle.value()
-	var batch [udpMmsgBatchSize]packet
-	var sb udpSendBatch
+	var batch [udpmmsg.BatchSize]packet
 	for {
 		select {
 		case <-a.ctx.Done():
@@ -349,7 +353,7 @@ func (a *udpAssociation) sendLoop() {
 			batch[0] = p
 			n := 1
 			drainedBytes := int64(len(p.payload))
-			for n < udpMmsgBatchSize {
+			for n < udpmmsg.BatchSize {
 				select {
 				case p2 := <-a.queue:
 					batch[n] = p2
@@ -365,23 +369,23 @@ func (a *udpAssociation) sendLoop() {
 				a.send(a.ctx, batch[0], idle)
 				batch[0] = packet{}
 			} else {
-				a.sendBatch(a.ctx, batch[:n], idle, &sb)
+				a.sendBatch(a.ctx, batch[:n], idle)
 				clear(batch[:n])
 			}
 		}
 	}
 }
 
-func (a *udpAssociation) sendBatch(ctx context.Context, batch []packet, idle time.Duration, sb *udpSendBatch) {
+func (a *udpAssociation) sendBatch(ctx context.Context, batch []packet, idle time.Duration) {
 	defer func() {
 		for _, p := range batch {
 			releasePacket(p)
 		}
 	}()
 	var (
-		pkts4, pkts6   [udpMmsgBatchSize][]byte
-		addrs4, addrs6 [udpMmsgBatchSize]netip.AddrPort
-		rts4, rts6     [udpMmsgBatchSize]*udpRoute
+		pkts4, pkts6   [udpmmsg.BatchSize][]byte
+		addrs4, addrs6 [udpmmsg.BatchSize]netip.AddrPort
+		rts4, rts6     [udpmmsg.BatchSize]*udpRoute
 		n4, n6         int
 
 		lastTarget Address
@@ -482,7 +486,7 @@ func (a *udpAssociation) sendBatch(ctx context.Context, batch []packet, idle tim
 			a.outbound4.SetWriteDeadline(now.Add(dialTimeout))
 			a.lastOutWriteDL4 = nowNano
 		}
-		sent, e := writeUDPBatch(a.outbound4, a.raw4, false, sb, pkts4[:n4], addrs4[:n4])
+		sent, e := udpmmsg.WriteBatch(a.outbound4, a.raw4, false, &a.sb4, pkts4[:n4], addrs4[:n4])
 		a.outputMu.Unlock()
 		for i := 0; i < sent; i++ {
 			a.flow.udpUp(rts4[i], len(pkts4[i]))
@@ -501,7 +505,7 @@ func (a *udpAssociation) sendBatch(ctx context.Context, batch []packet, idle tim
 			a.outbound6.SetWriteDeadline(now.Add(dialTimeout))
 			a.lastOutWriteDL6 = nowNano
 		}
-		sent, e := writeUDPBatch(a.outbound6, a.raw6, true, sb, pkts6[:n6], addrs6[:n6])
+		sent, e := udpmmsg.WriteBatch(a.outbound6, a.raw6, true, &a.sb6, pkts6[:n6], addrs6[:n6])
 		a.outputMu.Unlock()
 		for i := 0; i < sent; i++ {
 			a.flow.udpUp(rts6[i], len(pkts6[i]))
@@ -616,18 +620,18 @@ func (a *udpAssociation) returnLoop(socket *net.UDPConn) {
 	var lastSrcAddr netip.Addr
 	var lastSrcHost string
 	var pktSeen int
-	var rb *udpRecvBatch
+	var rb *udpmmsg.RecvBatch
 	var raw syscall.RawConn
 	defer func() {
 		if rb != nil {
-			releaseUDPRecvBatch(rb)
+			udpmmsg.ReleaseRecvBatch(rb)
 		}
 	}()
 	var (
-		outSrcs     [udpMmsgBatchSize]Address
-		outPayloads [udpMmsgBatchSize][]byte
-		outRTs      [udpMmsgBatchSize]*udpRoute
-		outLens     [udpMmsgBatchSize]int
+		outSrcs     [udpmmsg.BatchSize]Address
+		outPayloads [udpmmsg.BatchSize][]byte
+		outRTs      [udpmmsg.BatchSize]*udpRoute
+		outLens     [udpmmsg.BatchSize]int
 	)
 	for {
 		act := a.activity.Load()
@@ -636,7 +640,8 @@ func (a *udpAssociation) returnLoop(socket *net.UDPConn) {
 			lastReadDL = act
 		}
 		if rb == nil {
-			n, src, e := socket.ReadFromUDPAddrPort(b)
+			var oob [64]byte
+			n, oobn, flags, src, e := socket.ReadMsgUDPAddrPort(b, oob[:])
 			if e != nil {
 				if timeout, ok := e.(net.Error); ok && timeout.Timeout() && time.Since(time.Unix(0, a.activity.Load())) < idle {
 					lastReadDL = 0
@@ -647,26 +652,51 @@ func (a *udpAssociation) returnLoop(socket *net.UDPConn) {
 			addr := src.Addr().Unmap()
 			src = netip.AddrPortFrom(addr, src.Port())
 			now := time.Now()
-			client, rt, ok := a.acceptReturnWithMeta(src, n, now, idle)
-			if !ok {
-				a.server.counters.Dropped.Add(1)
-				a.server.failure(failUDPSource, "udp", -1)
-				continue
+			gso := udpmmsg.GROSegmentSize(oob[:oobn], flags)
+			if gso > 0 && n > gso {
+				for off := 0; off < n; off += gso {
+					end := min(off+gso, n)
+					seg := b[off:end]
+					client, rt, ok := a.acceptReturnWithMeta(src, len(seg), now, idle)
+					if !ok {
+						a.server.counters.Dropped.Add(1)
+						a.server.failure(failUDPSource, "udp", -1)
+						continue
+					}
+					if addr != lastSrcAddr {
+						lastSrcAddr = addr
+						lastSrcHost = addr.String()
+					}
+					if e = a.output(client, Address{lastSrcHost, src.Port()}, seg, idle); e != nil {
+						return
+					}
+					if a.flow != nil {
+						a.flow.udpDown(rt, len(seg))
+					}
+					pktSeen++
+				}
+			} else {
+				client, rt, ok := a.acceptReturnWithMeta(src, n, now, idle)
+				if !ok {
+					a.server.counters.Dropped.Add(1)
+					a.server.failure(failUDPSource, "udp", -1)
+					continue
+				}
+				if addr != lastSrcAddr {
+					lastSrcAddr = addr
+					lastSrcHost = addr.String()
+				}
+				payload := b[:n]
+				source := Address{lastSrcHost, src.Port()}
+				if e = a.output(client, source, payload, idle); e != nil {
+					return
+				}
+				if a.flow != nil {
+					a.flow.udpDown(rt, n)
+				}
+				pktSeen++
 			}
-			if addr != lastSrcAddr {
-				lastSrcAddr = addr
-				lastSrcHost = addr.String()
-			}
-			payload := b[:n]
-			source := Address{lastSrcHost, src.Port()}
-			if e = a.output(client, source, payload, idle); e != nil {
-				return
-			}
-			if a.flow != nil {
-				a.flow.udpDown(rt, n)
-			}
-			pktSeen++
-			if pktSeen == udpMmsgUpgradeCnt {
+			if pktSeen >= udpmmsg.UpgradeCnt {
 				if socket == a.outbound4 {
 					raw = a.raw4
 				} else if socket == a.outbound6 {
@@ -675,14 +705,14 @@ func (a *udpAssociation) returnLoop(socket *net.UDPConn) {
 					raw, _ = socket.SyscallConn()
 				}
 				if raw != nil {
-					rb = acquireUDPRecvBatch()
+					rb = udpmmsg.AcquireRecvBatch()
 					b = nil // release single-packet buffer once upgraded
 				}
 			}
 			continue
 		}
 
-		cnt, e := readUDPBatch(socket, raw, rb)
+		cnt, e := udpmmsg.ReadBatch(socket, raw, rb)
 		if e != nil {
 			if timeout, ok := e.(net.Error); ok && timeout.Timeout() && time.Since(time.Unix(0, a.activity.Load())) < idle {
 				lastReadDL = 0
@@ -697,8 +727,8 @@ func (a *udpAssociation) returnLoop(socket *net.UDPConn) {
 		a.mu.Lock()
 		client = a.client
 		for i := 0; i < cnt; i++ {
-			src := rb.addrs[i]
-			n := rb.lens[i]
+			src := rb.Addrs[i]
+			n := rb.Lens[i]
 			if !src.IsValid() || n > maxDatagram {
 				a.server.counters.Dropped.Add(1)
 				a.server.failure(failUDPSource, "udp", -1)
@@ -723,7 +753,7 @@ func (a *udpAssociation) returnLoop(socket *net.UDPConn) {
 				lastSrcHost = addr.String()
 			}
 			outSrcs[valid] = Address{lastSrcHost, src.Port()}
-			outPayloads[valid] = rb.bufs[i][:n]
+			outPayloads[valid] = rb.Bufs[i][:n]
 			outRTs[valid] = a.routes[src]
 			outLens[valid] = n
 			valid++
@@ -784,9 +814,8 @@ func (a *udpAssociation) outputBatch(client netip.AddrPort, sources []Address, p
 			return nil
 		}
 		var (
-			pkts  [udpMmsgBatchSize][]byte
-			addrs [udpMmsgBatchSize]netip.AddrPort
-			sb    udpSendBatch
+			pkts  [udpmmsg.BatchSize][]byte
+			addrs [udpmmsg.BatchSize]netip.AddrPort
 			n     int
 		)
 		for i := range payloads {
@@ -811,7 +840,7 @@ func (a *udpAssociation) outputBatch(client netip.AddrPort, sources []Address, p
 			a.native.SetWriteDeadline(now.Add(dialTimeout))
 			a.lastOutputWriteDL = nowNano
 		}
-		_, e := writeUDPBatch(a.native, a.rawNative, a.v6Native, &sb, pkts[:n], addrs[:n])
+		_, e := udpmmsg.WriteBatch(a.native, a.rawNative, a.v6Native, &a.sbNative, pkts[:n], addrs[:n])
 		return e
 	}
 	for i := range payloads {

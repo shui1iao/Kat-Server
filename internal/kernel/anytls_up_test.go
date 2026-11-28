@@ -70,7 +70,7 @@ func TestAnyTLSUpBlockedTargetLifecycle(t *testing.T) {
 			}()
 			go func() {
 				served <- codec.Serve(ctx, server, func(stctx context.Context, st *A.Stream, r A.Request) {
-					relay.relayAnyTLS(stctx, &anyStream{server, st}, target)
+					relay.relayAnyTLS(stctx, 0, &anyStream{server, st}, target)
 					handled <- st.SessionStats()
 				})
 			}()

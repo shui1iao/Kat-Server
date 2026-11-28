@@ -102,6 +102,7 @@ type Inbound struct {
 	// 0.7.0: source lists (all inbounds), Trojan fallback, SOCKS5 options.
 	Sources           *SourceOptions `json:"sources,omitempty"`
 	Fallback          string         `json:"fallback,omitempty"`
+	trojanDigests     [][56]byte
 	SOCKS5            *SOCKS5Options `json:"socks5,omitempty"`
 	srcAllow, srcDeny []netip.Prefix
 	// anytlsSessionsAuto is the max_sessions value Validate derived from
@@ -380,6 +381,7 @@ func (c *Config) Validate() error {
 				}
 				seen[u.Password] = true
 			}
+			in.trojanDigests = precomputeTrojanDigests(in.Users)
 		case "vless", "snell", "http":
 			return fmt.Errorf("inbound protocol %q is not supported in Kat-Server (supported: shadowsocks, anytls, trojan, socks5)", in.Protocol)
 		default:

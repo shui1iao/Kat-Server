@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	A "github.com/shui1iao/Kat/internal/anytls"
+	"github.com/shui1iao/Kat/internal/udpmmsg"
 	"io"
 	"net"
 	"reflect"
@@ -203,7 +204,7 @@ func (s *Server) serveAnyTLS(parent context.Context, c net.Conn, in Inbound) {
 				}
 				return udp.WritePacket(from, b)
 			}, UDPWriteBatch: func(as []Address, bs [][]byte) error {
-				var fromsBuf [udpMmsgBatchSize]A.Address
+				var fromsBuf [udpmmsg.BatchSize]A.Address
 				froms := fromsBuf[:0]
 				if len(as) > len(fromsBuf) {
 					froms = make([]A.Address, 0, len(as))
@@ -233,7 +234,7 @@ func (s *Server) serveAnyTLS(parent context.Context, c net.Conn, in Inbound) {
 		}
 		defer f.end("ok")
 		defer out.Close()
-		s.relayAnyTLS(fctx, stream, out)
+		s.relayAnyTLS(fctx, in.logIndex, stream, out)
 	})
 	if k, ok := anyTLSFailure(e); ok {
 		s.failure(k, in.Protocol, in.logIndex)
@@ -245,7 +246,7 @@ func (s *Server) serveAnyTLS(parent context.Context, c net.Conn, in Inbound) {
 
 // Session FIN cancels its stream, so stop both directions on EOF rather than
 // falsely asserting TCP half-close. Join both workers before returning to Serve.
-func (s *Server) relayAnyTLS(ctx context.Context, stream, out net.Conn) {
+func (s *Server) relayAnyTLS(ctx context.Context, logIndex int, stream, out net.Conn) {
 	var last atomic.Int64
 	last.Store(time.Now().UnixNano())
 	done := make(chan error, 2)
@@ -270,7 +271,7 @@ func (s *Server) relayAnyTLS(ctx context.Context, stream, out net.Conn) {
 			return
 		case e := <-done:
 			if !quietFailure(e) && !errors.Is(e, A.ErrStreamClosed) {
-				s.failure(failTCPIO, "anytls", -1)
+				s.failure(failTCPIO, "anytls", logIndex)
 			}
 			stream.Close()
 			out.Close()
